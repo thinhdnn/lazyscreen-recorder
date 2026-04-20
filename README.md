@@ -1,5 +1,8 @@
 # LazyScreen Recorder
 
+<img width="981" height="1016" alt="image" src="https://github.com/user-attachments/assets/20e6c46c-a183-4ab4-88b5-ffeff4b67620" />
+
+
 Simple screen recorder for lazy people.
 
 ## Why LazyScreen

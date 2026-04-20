@@ -82,8 +82,12 @@ describe('normalizeSubtitleSettings', () => {
 // ─── normalizeRecordingQuality ──────────────────────────────────────────────
 
 describe('normalizeRecordingQuality', () => {
-  test('returns compact for compact', () => {
-    expect(normalizeRecordingQuality('compact')).toBe('compact');
+  test('returns balance for balance', () => {
+    expect(normalizeRecordingQuality('balance')).toBe('balance');
+  });
+
+  test('returns high for high', () => {
+    expect(normalizeRecordingQuality('high')).toBe('high');
   });
 
   test('returns normal for normal', () => {

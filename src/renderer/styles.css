@@ -26,6 +26,8 @@
   --border: rgba(255, 255, 255, 0.06);
   --border-visible: rgba(255, 255, 255, 0.1);
   --ring-accent: rgba(59, 130, 246, 0.22);
+  --overlay-surface: rgba(15, 23, 42, 0.9);
+  --shadow-soft: 0 4px 14px rgba(2, 6, 23, 0.28);
   --r: 12px;
   --r-sm: 8px;
   --r-xs: 5px;
@@ -186,7 +188,7 @@ html.theme-light .titlebar-btn .theme-icon--moon {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: 10px;
   padding: 10px 14px;
   border: 1px solid transparent;
   border-radius: var(--r-sm);
@@ -299,8 +301,15 @@ html.theme-light .titlebar-btn .theme-icon--moon {
   text-overflow: ellipsis;
   display: flex;
   align-items: center;
-  gap: 5px;
-  padding: 0 2px;
+  gap: 8px;
+  line-height: 1.3;
+  padding: 1px 2px;
+}
+
+.source-card .source-name span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .source-card.selected .source-name {
@@ -363,6 +372,8 @@ html.theme-light .titlebar-btn .theme-icon--moon {
   border-radius: var(--r);
   overflow: hidden;
   border: 1px solid var(--border);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-soft);
 }
 
 .app-group-header {
@@ -371,7 +382,7 @@ html.theme-light .titlebar-btn .theme-icon--moon {
   gap: 10px;
   padding: 10px 14px;
   cursor: pointer;
-  background: var(--bg-surface);
+  background: transparent;
   transition: background var(--transition);
 }
 
@@ -428,10 +439,10 @@ html.theme-light .titlebar-btn .theme-icon--moon {
 
 .app-group-content {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: 1fr;
   gap: 8px;
   padding: 8px;
-  background: var(--bg-base);
+  background: color-mix(in srgb, var(--bg-base) 82%, transparent);
   max-height: 800px;
   overflow: hidden;
   transition: max-height 250ms ease, padding 250ms ease, opacity 180ms ease;
@@ -442,6 +453,16 @@ html.theme-light .titlebar-btn .theme-icon--moon {
   max-height: 0;
   padding: 0 8px;
   opacity: 0;
+}
+
+.source-card--compact {
+  padding: 10px 12px;
+}
+
+.source-card--compact .source-name {
+  margin-top: 0;
+  font-size: 12.5px;
+  padding: 2px 2px;
 }
 
 /* ── Area Selection ───────────────────────────────────────── */
@@ -511,6 +532,7 @@ html.theme-light .titlebar-btn .theme-icon--moon {
   background: var(--green-soft);
   padding: 10px 16px;
   border-radius: var(--r-sm);
+  border: 1px solid rgba(34, 197, 94, 0.3);
 }
 
 .area-preview svg {
@@ -562,9 +584,9 @@ html.theme-light .titlebar-btn .theme-icon--moon {
 .audio-chip-body {
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 8px;
-  padding: 9px 12px;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 10px 13px;
   border-radius: var(--r-sm);
   background: var(--bg-base);
   border: 1px solid var(--border);
@@ -577,6 +599,11 @@ html.theme-light .titlebar-btn .theme-icon--moon {
 .audio-chip-body svg {
   width: 16px;
   height: 16px;
+  flex-shrink: 0;
+}
+
+.audio-chip-body span {
+  line-height: 1.25;
 }
 
 .audio-chip-body:hover {
@@ -629,24 +656,31 @@ html.theme-light .titlebar-btn .theme-icon--moon {
 .auto-stop-minutes-wrap {
   display: flex;
   align-items: center;
-  gap: 6px;
+  flex-wrap: wrap;
+  gap: 10px;
   width: 100%;
-  padding: 2px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg-base);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.01);
 }
 
 .auto-stop-minutes-label {
   font-size: 12px;
   color: var(--text-secondary);
   white-space: nowrap;
+  line-height: 1.2;
 }
 
 .auto-stop-minutes-input {
-  width: 56px;
-  padding: 3px 6px;
+  width: 68px;
+  height: 30px;
+  padding: 5px 8px;
   font-size: 12px;
   border: 1px solid var(--border-visible);
   border-radius: var(--r-xs);
-  background: var(--bg-elevated);
+  background: var(--bg-surface);
   color: var(--text-primary);
   text-align: center;
 }
@@ -658,21 +692,36 @@ html.theme-light .titlebar-btn .theme-icon--moon {
 }
 
 .auto-stop-source-quick {
-  margin-left: auto;
-  min-width: 132px;
-  padding: 3px 6px;
+  min-width: 176px;
+  height: 30px;
+  padding: 5px 8px;
   font-size: 12px;
   border: 1px solid var(--border-visible);
   border-radius: var(--r-xs);
-  background: var(--bg-elevated);
+  background: var(--bg-surface);
   color: var(--text-primary);
+}
+
+.auto-stop-source-quick:focus,
+.auto-stop-minutes-input:focus {
+  border-color: var(--accent);
+  outline: none;
+  box-shadow: 0 0 0 2px var(--ring-accent);
+}
+
+.auto-stop-meter-quick {
+  width: 100%;
+  margin-top: 2px;
 }
 
 .auto-stop-countdown {
   font-size: 11px;
   color: var(--text-muted);
-  margin-left: auto;
+  margin-left: 0;
+  padding-left: 10px;
+  border-left: 1px solid var(--border);
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .auto-stop-countdown--active {
@@ -683,6 +732,7 @@ html.theme-light .titlebar-btn .theme-icon--moon {
 .control-bar {
   display: flex;
   align-items: center;
+  gap: 14px;
   padding: 12px 20px;
   background: var(--bg-surface);
   border-top: 1px solid var(--border);
@@ -707,6 +757,10 @@ html.theme-light .titlebar-btn .theme-icon--moon {
   flex: 1;
   display: flex;
   justify-content: flex-end;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding-left: 12px;
 }
 
 .rec-indicator {
@@ -759,11 +813,14 @@ html.theme-light .titlebar-btn .theme-icon--moon {
 .status {
   font-size: 12px;
   color: var(--text-muted);
-  max-width: 160px;
+  flex: 0 1 220px;
+  min-width: 0;
+  max-width: 220px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   text-align: right;
+  line-height: 1.25;
 }
 
 /* Record Button */
@@ -904,7 +961,7 @@ html.theme-light .titlebar-btn .theme-icon--moon {
   left: 12px;
   z-index: 4;
   border: 1px solid var(--border-visible);
-  background: rgba(15, 23, 42, 0.7);
+  background: var(--overlay-surface);
   color: var(--text-primary);
   border-radius: var(--r-xs);
   padding: 6px 10px;
@@ -928,8 +985,8 @@ html.theme-light .titlebar-btn .theme-icon--moon {
   padding: 8px 10px;
   border-radius: var(--r-sm);
   border: 1px solid var(--border-visible);
-  background: rgba(15, 23, 42, 0.88);
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+  background: var(--overlay-surface);
+  box-shadow: var(--shadow-soft);
 }
 
 .subtitle-preview-toolbar-label {
@@ -974,16 +1031,16 @@ html.theme-light .titlebar-btn .theme-icon--moon {
 
 .preview-stt-wrap {
   position: absolute;
-  bottom: 0;
-  left: 0;
-  right: 0;
+  bottom: 12px;
+  left: 12px;
+  right: 12px;
   z-index: 6;
-  max-height: 42vh;
+  max-height: 36vh;
   overflow: auto;
-  border-top: 1px solid var(--border-visible);
-  background: rgba(15, 23, 42, 0.94);
-  border-radius: var(--r-sm) var(--r-sm) 0 0;
-  box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border-visible);
+  background: var(--overlay-surface);
+  border-radius: var(--r-sm);
+  box-shadow: var(--shadow-soft);
 }
 
 .preview-stt-summary {
@@ -994,6 +1051,11 @@ html.theme-light .titlebar-btn .theme-icon--moon {
   color: var(--text-secondary);
   list-style: none;
   user-select: none;
+}
+
+.preview-stt-summary:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
 }
 
 .preview-stt-summary::-webkit-details-marker {
@@ -1015,7 +1077,7 @@ html.theme-light .titlebar-btn .theme-icon--moon {
   padding: 0 12px 12px;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
 .preview-stt-hint {
@@ -1036,7 +1098,7 @@ html.theme-light .titlebar-btn .theme-icon--moon {
 }
 
 label.preview-stt-check {
-  margin-top: 2px;
+  margin-top: 0;
 }
 
 .subtitle-overlay {
@@ -1083,7 +1145,7 @@ label.preview-stt-check {
   resize: vertical;
   border-radius: var(--r-sm);
   border: 1px solid var(--border-visible);
-  background: rgba(15, 23, 42, 0.92);
+  background: var(--overlay-surface);
   color: var(--text-primary);
   font-size: 13px;
   line-height: 1.35;
@@ -1118,6 +1180,7 @@ label.preview-stt-check {
   border-radius: var(--r);
   border: 1px solid var(--border-visible);
   background: var(--bg-surface);
+  box-shadow: var(--shadow-soft);
   padding: 16px;
   display: flex;
   flex-direction: column;
@@ -1363,6 +1426,7 @@ body.recording-paused .titlebar {
   border-radius: var(--r);
   border: 1px solid var(--border-visible);
   background: var(--bg-surface);
+  box-shadow: var(--shadow-soft);
   padding: 16px;
   display: flex;
   flex-direction: column;
@@ -1428,10 +1492,12 @@ html.theme-light {
   --border: rgba(15, 23, 42, 0.08);
   --border-visible: rgba(15, 23, 42, 0.14);
   --ring-accent: rgba(37, 99, 235, 0.28);
+  --overlay-surface: rgba(255, 255, 255, 0.96);
+  --shadow-soft: 0 6px 16px rgba(15, 23, 42, 0.1);
 }
 
 html.theme-light .btn-preview-back {
-  background: rgba(255, 255, 255, 0.94);
+  background: var(--overlay-surface);
   border-color: var(--border-visible);
 }
 
@@ -1440,13 +1506,11 @@ html.theme-light .btn-preview-back:hover {
 }
 
 html.theme-light .subtitle-preview-toolbar {
-  background: rgba(255, 255, 255, 0.95);
-  box-shadow: 0 2px 12px rgba(15, 23, 42, 0.12);
+  background: var(--overlay-surface);
 }
 
 html.theme-light .preview-stt-wrap {
-  background: rgba(255, 255, 255, 0.97);
-  box-shadow: 0 -4px 20px rgba(15, 23, 42, 0.1);
+  background: var(--overlay-surface);
 }
 
 html.theme-light .subtitle-edit-label {

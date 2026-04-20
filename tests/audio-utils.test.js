@@ -229,16 +229,20 @@ describe('vadStepRmsFallback', () => {
 // ─── videoBitrateForRecordingQuality ────────────────────────────────────────
 
 describe('videoBitrateForRecordingQuality', () => {
-  test('returns 2.5Mbps for normal', () => {
-    expect(videoBitrateForRecordingQuality('normal')).toBe(2_500_000);
+  test('returns 3.0Mbps for balance', () => {
+    expect(videoBitrateForRecordingQuality('balance')).toBe(3_000_000);
   });
 
-  test('returns 1.4Mbps for compact', () => {
-    expect(videoBitrateForRecordingQuality('compact')).toBe(1_400_000);
+  test('returns 5.0Mbps for normal', () => {
+    expect(videoBitrateForRecordingQuality('normal')).toBe(5_000_000);
+  });
+
+  test('returns 8.0Mbps for high quality', () => {
+    expect(videoBitrateForRecordingQuality('high')).toBe(8_000_000);
   });
 
   test('returns normal bitrate for unknown quality', () => {
-    expect(videoBitrateForRecordingQuality(undefined)).toBe(2_500_000);
-    expect(videoBitrateForRecordingQuality('hd')).toBe(2_500_000);
+    expect(videoBitrateForRecordingQuality(undefined)).toBe(5_000_000);
+    expect(videoBitrateForRecordingQuality('hd')).toBe(5_000_000);
   });
 });

@@ -34,7 +34,8 @@ function normalizeSubtitleSettings(settings) {
 }
 
 function normalizeRecordingQuality(quality) {
-  return quality === 'compact' ? 'compact' : 'normal';
+  if (quality === 'balance' || quality === 'high') return quality;
+  return 'normal';
 }
 
 function normalizeUiTheme(theme) {

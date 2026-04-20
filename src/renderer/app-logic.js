@@ -41,9 +41,6 @@
   }
 
   function recordingStatusMessage(maxSegmentBytes, segmentPartIndex) {
-    if (maxSegmentBytes > 0) {
-      return `Recording... part ${segmentPartIndex} (max ${Math.round(maxSegmentBytes / 1024 / 1024)} MB/part)`;
-    }
     return 'Recording...';
   }
 

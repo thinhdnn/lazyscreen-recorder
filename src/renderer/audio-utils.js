@@ -73,7 +73,9 @@ function vadStepRmsFallback(state, rms) {
 }
 
 function videoBitrateForRecordingQuality(q) {
-  return q === 'compact' ? 1_400_000 : 2_500_000;
+  if (q === 'balance') return 3_000_000;
+  if (q === 'high') return 8_000_000;
+  return 5_000_000;
 }
 
 if (typeof module !== 'undefined' && module.exports) {

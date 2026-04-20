@@ -38,8 +38,6 @@ describe('renderer app logic helpers', () => {
 
   test('recordingStatusMessage supports segmented and single-file modes', () => {
     expect(recordingStatusMessage(0, 1)).toBe('Recording...');
-    expect(recordingStatusMessage(20 * 1024 * 1024, 3)).toBe(
-      'Recording... part 3 (max 20 MB/part)'
-    );
+    expect(recordingStatusMessage(20 * 1024 * 1024, 3)).toBe('Recording...');
   });
 });

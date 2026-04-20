@@ -5,6 +5,8 @@ const mockGetMediaAccessStatus = jest.fn(() => 'granted');
 const mockAskForMediaAccess = jest.fn(async () => true);
 const mockDesktopGetSources = jest.fn(async () => []);
 const mockShowOpenDialog = jest.fn(async () => ({ canceled: true, filePaths: [] }));
+const mockShowSaveDialog = jest.fn(async () => ({ canceled: true }));
+const mockFixWebmMetaInfo = jest.fn(async (blob) => blob);
 
 jest.mock('electron', () => ({
   app: {
@@ -33,7 +35,7 @@ jest.mock('electron', () => ({
     getSources: (...args) => mockDesktopGetSources(...args),
   },
   dialog: {
-    showSaveDialog: jest.fn(async () => ({ canceled: true })),
+    showSaveDialog: (...args) => mockShowSaveDialog(...args),
     showOpenDialog: (...args) => mockShowOpenDialog(...args),
   },
   screen: {
@@ -45,10 +47,6 @@ jest.mock('electron', () => ({
   },
 }));
 
-jest.mock('../src/main/ffmpeg', () => ({
-  convertToMp4: jest.fn(),
-  burnSubtitlesIntoVideo: jest.fn(),
-}));
 jest.mock('../src/main/soniox', () => ({
   SonioxClient: jest.fn(),
 }));
@@ -57,6 +55,31 @@ jest.mock('../src/main/subtitles', () => ({
   buildVtt: jest.fn(() => ''),
 }));
 jest.mock('../src/main/settings-utils', () => ({}));
+jest.mock('fix-webm-metainfo', () => ({
+  __esModule: true,
+  default: (...args) => mockFixWebmMetaInfo(...args),
+}));
+jest.mock('ts-ebml', () => ({
+  Decoder: class {
+    decode() {
+      return [];
+    }
+  },
+  Reader: class {
+    constructor() {
+      this.duration = 0;
+      this.cues = [];
+      this.metadatas = [];
+      this.metadataSize = 0;
+      this.logging = false;
+    }
+    read() {}
+    stop() {}
+  },
+  tools: {
+    makeMetadataSeekable: jest.fn(() => Buffer.from([])),
+  },
+}));
 
 describe('main/index helper logic', () => {
   const loadIndex = () => require('../src/main/index');
@@ -82,6 +105,10 @@ describe('main/index helper logic', () => {
     mockDesktopGetSources.mockResolvedValue([]);
     mockShowOpenDialog.mockReset();
     mockShowOpenDialog.mockResolvedValue({ canceled: true, filePaths: [] });
+    mockShowSaveDialog.mockReset();
+    mockShowSaveDialog.mockResolvedValue({ canceled: true });
+    mockFixWebmMetaInfo.mockReset();
+    mockFixWebmMetaInfo.mockImplementation(async (blob) => blob);
   });
 
   test('windowBackgroundForTheme returns expected colors', () => {
@@ -181,7 +208,7 @@ describe('main/index helper logic', () => {
       subtitlePositionX: 110,
       subtitlePositionY: -10,
       burnSubtitlesIntoVideo: false,
-      recordingQuality: 'compact',
+      recordingQuality: 'high',
       sttSourceLanguage: 'vi',
       sttLanguageHintsStrict: 1,
       sttContextDomain: 'x',
@@ -192,7 +219,7 @@ describe('main/index helper logic', () => {
       autoStopOnSilence: true,
       autoStopSilenceMinutes: 2,
       autoStopAudioSource: 'mic',
-      autoStopMicDeviceId: 'dev-1',
+      autoStopMicDeviceId: 'mic-device-1',
     });
     const settings = handlers['settings-get']();
     expect(settings.uiTheme).toBe('light');
@@ -200,8 +227,10 @@ describe('main/index helper logic', () => {
     expect(settings.subtitleFontSizePx).toBe(48);
     expect(settings.subtitlePositionX).toBe(100);
     expect(settings.subtitlePositionY).toBe(0);
-    expect(settings.recordingQuality).toBe('compact');
+    expect(settings.recordingQuality).toBe('high');
+    expect(settings.autoStopOnSilence).toBe(true);
     expect(settings.autoStopAudioSource).toBe('mic');
+    expect(settings.autoStopMicDeviceId).toBe('mic-device-1');
   });
 
   test('settings-pick-output-folder returns selected path', async () => {
@@ -213,5 +242,35 @@ describe('main/index helper logic', () => {
     });
     const result = await handlers['settings-pick-output-folder']();
     expect(result).toEqual({ canceled: false, folderPath: '/tmp/records' });
+  });
+
+  test('save-recording rebuilds WebM metadata before writing file', async () => {
+    loadIndex();
+    const handlers = getHandleMap();
+    mockShowSaveDialog.mockResolvedValueOnce({
+      canceled: false,
+      filePath: '/tmp/recording.webm',
+    });
+    const fs = require('fs');
+    const writeSpy = jest.spyOn(fs, 'writeFileSync').mockImplementation(() => {});
+    const mkdirSpy = jest.spyOn(fs, 'mkdirSync').mockImplementation(() => {});
+
+    const result = await handlers['save-recording'](null, {
+      buffer: new Uint8Array([1, 2, 3, 4]).buffer,
+      durationMs: 4321,
+      subtitles: [],
+      subtitleFormat: 'srt',
+    });
+
+    expect(mockFixWebmMetaInfo).toHaveBeenCalledTimes(1);
+    expect(writeSpy).toHaveBeenCalledWith('/tmp/recording.webm', expect.any(Buffer));
+    expect(result).toEqual({
+      success: true,
+      filePath: '/tmp/recording.webm',
+      subtitlePath: null,
+    });
+
+    writeSpy.mockRestore();
+    mkdirSpy.mockRestore();
   });
 });

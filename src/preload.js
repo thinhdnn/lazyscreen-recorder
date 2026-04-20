@@ -44,6 +44,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   pickOutputFolder: () => ipcRenderer.invoke('settings-pick-output-folder'),
   getAutoPartPath: (payload) =>
     ipcRenderer.invoke('get-auto-part-path', payload),
+  startAudioCapLevelMonitor: () => ipcRenderer.invoke('audiocap-level-start'),
+  stopAudioCapLevelMonitor: () => ipcRenderer.invoke('audiocap-level-stop'),
 
   // area overlay → main
   areaSelected: (rect) => ipcRenderer.send('area-selected', rect),
@@ -68,5 +70,14 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   onSttError: (callback) => {
     ipcRenderer.on('stt-error', (_event, payload) => callback(payload));
+  },
+  onAudioCapLevel: (callback) => {
+    ipcRenderer.on('audiocap-level', (_event, payload) => callback(payload));
+  },
+  onAudioCapPcm: (callback) => {
+    ipcRenderer.on('audiocap-pcm', (_event, payload) => callback(payload));
+  },
+  onAudioCapLevelError: (callback) => {
+    ipcRenderer.on('audiocap-level-error', (_event, payload) => callback(payload));
   },
 });

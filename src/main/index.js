@@ -9,8 +9,9 @@ const {
 } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { execSync } = require('child_process');
-const { convertToMp4, burnSubtitlesIntoVideo } = require('./ffmpeg');
+const { execSync, spawn } = require('child_process');
+const fixWebmMetaInfo = require('fix-webm-metainfo').default;
+const { Decoder, Reader, tools } = require('ts-ebml');
 const { SonioxClient } = require('./soniox');
 const { buildSrt, buildVtt } = require('./subtitles');
 const settingsUtils = require('./settings-utils');
@@ -18,6 +19,9 @@ const settingsUtils = require('./settings-utils');
 let mainWindow = null;
 let areaOverlayWindow = null;
 let sttSession = null;
+let audioCapMonitorProcess = null;
+let audioCapPcmRemainder = Buffer.alloc(0);
+let audioCapMonitorStopping = false;
 let appSettings = {
   sonioxApiKey: '',
   outputFolder: '',
@@ -39,9 +43,52 @@ let appSettings = {
   sttTranslationTargetLanguage: '',
   autoStopOnSilence: false,
   autoStopSilenceMinutes: 3,
-  autoStopAudioSource: 'both',
+  autoStopAudioSource: 'system',
   autoStopMicDeviceId: '',
 };
+
+async function probeWebmMetadata(blob) {
+  try {
+    const arr = await blob.arrayBuffer();
+    const elements = new Decoder().decode(Buffer.from(arr));
+    const reader = new Reader();
+    reader.logging = false;
+    for (const elm of elements) reader.read(elm);
+    reader.stop();
+    return {
+      durationMs: Number(reader.duration) || 0,
+      cuesCount: Array.isArray(reader.cues) ? reader.cues.length : 0,
+    };
+  } catch (_) {
+    return { durationMs: 0, cuesCount: 0 };
+  }
+}
+
+async function forceWebmDurationMs(blob, requestedDurationMs) {
+  const targetMs = Number(requestedDurationMs) || 0;
+  if (targetMs <= 0) return blob;
+  try {
+    const arr = await blob.arrayBuffer();
+    const raw = Buffer.from(arr);
+    const elements = new Decoder().decode(raw);
+    const reader = new Reader();
+    reader.logging = false;
+    for (const elm of elements) reader.read(elm);
+    reader.stop();
+    if (!Number.isFinite(reader.metadataSize) || reader.metadataSize <= 0) {
+      return blob;
+    }
+    const refinedMetadataBuf = tools.makeMetadataSeekable(
+      reader.metadatas,
+      targetMs,
+      reader.cues
+    );
+    const body = raw.slice(reader.metadataSize);
+    return new Blob([refinedMetadataBuf, body], { type: blob.type || 'video/webm' });
+  } catch (_) {
+    return blob;
+  }
+}
 
 function getSettingsPath() {
   return path.join(app.getPath('userData'), 'settings.json');
@@ -80,7 +127,10 @@ function normalizeSubtitleSettings() {
 
 function normalizeRecordingQuality() {
   appSettings.recordingQuality =
-    appSettings.recordingQuality === 'compact' ? 'compact' : 'normal';
+    appSettings.recordingQuality === 'balance' ||
+    appSettings.recordingQuality === 'high'
+      ? appSettings.recordingQuality
+      : 'normal';
 }
 
 function normalizeUiTheme() {
@@ -92,12 +142,8 @@ function normalizeAutoStopSettings() {
   const mins = Number(appSettings.autoStopSilenceMinutes);
   appSettings.autoStopSilenceMinutes =
     Number.isFinite(mins) && mins >= 0.5 ? Math.min(60, mins) : 3;
-  const src =
-    typeof appSettings.autoStopAudioSource === 'string'
-      ? appSettings.autoStopAudioSource.trim().toLowerCase()
-      : 'both';
   appSettings.autoStopAudioSource =
-    src === 'system' || src === 'mic' || src === 'both' ? src : 'both';
+    appSettings.autoStopAudioSource === 'mic' ? 'mic' : 'system';
   appSettings.autoStopMicDeviceId =
     typeof appSettings.autoStopMicDeviceId === 'string'
       ? appSettings.autoStopMicDeviceId
@@ -135,6 +181,123 @@ function saveSettings() {
   fs.writeFileSync(getSettingsPath(), JSON.stringify(appSettings, null, 2), 'utf-8');
 }
 
+const APP_ICON_PATH = path.join(__dirname, '..', '..', 'assets', 'icon.png');
+const APP_DOCK_ICON_PATH = path.join(__dirname, '..', '..', 'assets', 'icon.icns');
+
+function resolveAudioCapPath() {
+  const envPath = process.env.AUDIOCAP_PATH;
+  if (envPath && fs.existsSync(envPath)) return envPath;
+  const isWin = process.platform === 'win32';
+  const candidates = isWin
+    ? [
+      path.join(
+        __dirname,
+        '..',
+        '..',
+        'wasapi-audiocap',
+        'bin',
+        'Release',
+        'net8.0',
+        'win-x64',
+        'publish',
+        'audiocap.exe'
+      ),
+      path.join(__dirname, '..', '..', 'audiocap-bin', 'win', 'audiocap.exe'),
+      path.join(process.resourcesPath || '', 'audiocap', 'audiocap.exe'),
+    ]
+    : process.platform === 'darwin'
+      ? [
+        path.join(__dirname, '..', '..', 'swift-audiocap', '.build', 'apple', 'Products', 'Release', 'audiocap'),
+        path.join(__dirname, '..', '..', 'swift-audiocap', '.build', 'release', 'audiocap'),
+        path.join(__dirname, '..', '..', 'audiocap-bin', 'mac', 'audiocap'),
+        path.join(process.resourcesPath || '', 'audiocap', 'audiocap'),
+      ]
+      : [];
+  return candidates.find((p) => p && fs.existsSync(p)) || null;
+}
+
+function emitAudioCapLevelFromPcm(chunk) {
+  if (!mainWindow || !chunk || chunk.length === 0) return;
+  const merged = audioCapPcmRemainder.length
+    ? Buffer.concat([audioCapPcmRemainder, chunk])
+    : chunk;
+  const sampleBytes = 2;
+  const completeBytes = merged.length - (merged.length % sampleBytes);
+  if (completeBytes <= 0) {
+    audioCapPcmRemainder = merged;
+    return;
+  }
+  audioCapPcmRemainder = merged.subarray(completeBytes);
+  const frame = merged.subarray(0, completeBytes);
+  let sumSquares = 0;
+  let sampleCount = 0;
+  for (let i = 0; i < frame.length; i += 2) {
+    const sample = frame.readInt16LE(i) / 32768;
+    sumSquares += sample * sample;
+    sampleCount += 1;
+  }
+  if (sampleCount === 0) return;
+  const rms = Math.sqrt(sumSquares / sampleCount);
+  mainWindow.webContents.send('audiocap-level', { rms, sampleCount });
+  mainWindow.webContents.send('audiocap-pcm', { chunk: Uint8Array.from(chunk) });
+}
+
+function stopAudioCapMonitor(force = false) {
+  if (!force && !audioCapMonitorProcess) return;
+  if (!audioCapMonitorProcess) return;
+  audioCapMonitorStopping = true;
+  try {
+    audioCapMonitorProcess.kill('SIGTERM');
+  } catch (_) {}
+  audioCapMonitorProcess = null;
+  audioCapPcmRemainder = Buffer.alloc(0);
+}
+
+function startAudioCapMonitor() {
+  if (process.platform !== 'darwin' && process.platform !== 'win32') {
+    return { ok: false, reason: 'unsupported-platform' };
+  }
+  const audioCapPath = resolveAudioCapPath();
+  if (!audioCapPath) {
+    return { ok: false, reason: 'audiocap-not-found' };
+  }
+  if (audioCapMonitorProcess) {
+    return { ok: true, reused: true, path: audioCapPath };
+  }
+  const proc = spawn(audioCapPath, ['--sample-rate', '16000', '--channels', '1'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  audioCapMonitorStopping = false;
+  audioCapMonitorProcess = proc;
+  audioCapPcmRemainder = Buffer.alloc(0);
+  proc.stdout.on('data', (chunk) => emitAudioCapLevelFromPcm(chunk));
+  proc.stderr.on('data', (d) => {
+    const msg = String(d || '').trim();
+    if (msg) {
+      console.log('[audiocap]', msg);
+    }
+  });
+  proc.on('exit', () => {
+    audioCapMonitorProcess = null;
+    audioCapPcmRemainder = Buffer.alloc(0);
+    if (audioCapMonitorStopping) {
+      audioCapMonitorStopping = false;
+      return;
+    }
+    mainWindow?.webContents.send('audiocap-level-error', {
+      reason: 'audiocap-exited',
+    });
+  });
+  proc.on('error', (err) => {
+    audioCapMonitorProcess = null;
+    audioCapPcmRemainder = Buffer.alloc(0);
+    mainWindow?.webContents.send('audiocap-level-error', {
+      reason: err?.message || 'audiocap-spawn-failed',
+    });
+  });
+  return { ok: true, reused: false, path: audioCapPath };
+}
+
 function createMainWindow() {
   normalizeUiTheme();
   const themeArg = appSettings.uiTheme === 'light' ? 'light' : 'dark';
@@ -149,6 +312,7 @@ function createMainWindow() {
     vibrancy: 'under-window',
     visualEffectState: 'active',
     backgroundColor: windowBackgroundForTheme(themeArg),
+    icon: APP_ICON_PATH,
     webPreferences: {
       preload: path.join(__dirname, '..', 'preload.js'),
       contextIsolation: true,
@@ -166,6 +330,16 @@ function createMainWindow() {
 }
 
 app.whenReady().then(async () => {
+  if (process.platform === 'darwin' && app.dock) {
+    try {
+      const { nativeImage } = require('electron');
+      const dockIconPath = fs.existsSync(APP_DOCK_ICON_PATH)
+        ? APP_DOCK_ICON_PATH
+        : APP_ICON_PATH;
+      app.dock.setIcon(nativeImage.createFromPath(dockIconPath));
+    } catch (_) {}
+  }
+
   loadSettings();
   createMainWindow();
 
@@ -359,18 +533,33 @@ ipcMain.handle('start-area-selection', async () => {
   });
 });
 
-// ── IPC: Save recording (WebM → MP4) ───────────────────────────────────────
+// ── IPC: Save recording (WebM) ──────────────────────────────────────────────
 
 ipcMain.handle(
   'save-recording',
   async (_event, payload) => {
+  const saveFlowStartedAt = Date.now();
+  const logSaveFlow = (label, extra) => {
+    const elapsed = Date.now() - saveFlowStartedAt;
+    if (extra === undefined) {
+      console.log(`[timing][main-save] +${elapsed}ms ${label}`);
+      return;
+    }
+    console.log(`[timing][main-save] +${elapsed}ms ${label}`, extra);
+  };
   const {
     buffer,
-    cropRect,
     subtitles,
     subtitleFormat,
     filePath: explicitPath,
+    durationMs,
   } = payload;
+  const silentAutoSave = Boolean(explicitPath);
+  logSaveFlow('entered save-recording handler', {
+    bufferBytes: buffer?.byteLength || 0,
+    subtitleCount: Array.isArray(subtitles) ? subtitles.length : 0,
+    durationMs: Number(durationMs) || 0,
+  });
 
   const desktopPath = app.getPath('desktop');
   const defaultFolder =
@@ -383,110 +572,83 @@ ipcMain.handle(
   if (!filePath) {
     const { filePath: chosen, canceled } = await dialog.showSaveDialog(mainWindow, {
       title: 'Save Recording',
-      defaultPath: path.join(defaultFolder, `recording-${Date.now()}.mp4`),
-      filters: [{ name: 'MP4 Video', extensions: ['mp4'] }],
+      defaultPath: path.join(defaultFolder, `recording-${Date.now()}.webm`),
+      filters: [{ name: 'WebM Video', extensions: ['webm'] }],
     });
 
     if (canceled || !chosen) return { success: false, reason: 'cancelled' };
     filePath = chosen;
   }
+  logSaveFlow('resolved output path', { filePath });
 
   try {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
   } catch (_) {}
 
-  const tempDir = app.getPath('temp');
-  const tempWebm = path.join(tempDir, `rec-${Date.now()}.webm`);
-
   try {
-    fs.writeFileSync(tempWebm, Buffer.from(buffer));
-
-    mainWindow.webContents.send('conversion-progress', 'Converting to MP4...');
-    mainWindow?.webContents.send('save-progress', {
-      stage: 'start',
-      message: 'Converting to MP4…',
-      percent: null,
-    });
-    await convertToMp4(
-      tempWebm,
-      filePath,
-      cropRect,
-      appSettings.recordingQuality,
-      (payload) => {
-        mainWindow?.webContents.send('save-progress', {
-          stage: 'progress',
-          ...payload,
-        });
-      }
+    if (!silentAutoSave) {
+      mainWindow?.webContents.send('save-progress', {
+        stage: 'start',
+        message: 'Fixing WebM metadata…',
+        percent: null,
+      });
+    }
+    const rawBlob = new Blob([Buffer.from(buffer)], { type: 'video/webm' });
+    const metadataFixedBlob = await fixWebmMetaInfo(rawBlob);
+    const requestedDurationMs = Number(durationMs) || 0;
+    const finalBlob = await forceWebmDurationMs(
+      metadataFixedBlob,
+      requestedDurationMs
     );
-    mainWindow?.webContents.send('save-progress', {
-      stage: 'done',
-      message: 'Conversion complete',
+    const metadataProbe = await probeWebmMetadata(finalBlob);
+    const fixedBuffer = Buffer.from(await finalBlob.arrayBuffer());
+    logSaveFlow('rebuilt WebM seek metadata', {
       filePath,
-      percent: 100,
+      inputBytes: buffer?.byteLength || 0,
+      outputBytes: fixedBuffer.byteLength,
+      requestedDurationMs,
+      metadataDurationMs: metadataProbe.durationMs,
+      cuesCount: metadataProbe.cuesCount,
     });
+    fs.writeFileSync(filePath, fixedBuffer);
+    logSaveFlow('wrote WebM output', { filePath });
+    if (!silentAutoSave) {
+      mainWindow?.webContents.send('save-progress', {
+        stage: 'done',
+        message: 'WebM saved',
+        filePath,
+        percent: 100,
+      });
+    }
     let subtitlePath = null;
 
     if (Array.isArray(subtitles) && subtitles.length > 0) {
       const ext = subtitleFormat === 'vtt' ? 'vtt' : 'srt';
       const subtitleContent =
         ext === 'vtt' ? buildVtt(subtitles) : buildSrt(subtitles);
-      subtitlePath = filePath.replace(/\.mp4$/i, `.${ext}`);
+      subtitlePath = filePath.replace(/\.webm$/i, `.${ext}`);
       fs.writeFileSync(subtitlePath, subtitleContent, 'utf-8');
+      logSaveFlow('wrote subtitle sidecar', { subtitlePath, ext });
     }
 
-    let burnedPath = null;
-    if (
-      appSettings.burnSubtitlesIntoVideo &&
-      subtitlePath &&
-      fs.existsSync(subtitlePath) &&
-      fs.existsSync(filePath)
-    ) {
-      burnedPath = filePath.replace(/\.mp4$/i, '.burned.mp4');
-      mainWindow?.webContents.send('burn-progress', {
-        stage: 'start',
-        message: 'Burning subtitles into video…',
-        percent: null,
-      });
-      try {
-        await burnSubtitlesIntoVideo(
-          filePath,
-          subtitlePath,
-          burnedPath,
-          (payload) => {
-            mainWindow?.webContents.send('burn-progress', {
-              stage: 'progress',
-              ...payload,
-            });
-          },
-          appSettings.recordingQuality
-        );
-        mainWindow?.webContents.send('burn-progress', {
-          stage: 'done',
-          message: 'Burn complete',
-          filePath: burnedPath,
-          percent: 100,
-        });
-      } catch (burnErr) {
-        mainWindow?.webContents.send('burn-progress', {
-          stage: 'error',
-          message: burnErr.message || String(burnErr),
-        });
-        burnedPath = null;
-      }
-    }
-
-    return { success: true, filePath, subtitlePath, burnedPath };
-  } catch (err) {
-    mainWindow?.webContents.send('save-progress', {
-      stage: 'error',
-      message: err.message || String(err),
+    logSaveFlow('save-recording complete', {
+      totalDurationMs: Date.now() - saveFlowStartedAt,
+      filePath,
+      subtitlePath,
     });
+    return { success: true, filePath, subtitlePath };
+  } catch (err) {
+    logSaveFlow('save-recording failed', {
+      totalDurationMs: Date.now() - saveFlowStartedAt,
+      reason: err.message || String(err),
+    });
+    if (!silentAutoSave) {
+      mainWindow?.webContents.send('save-progress', {
+        stage: 'error',
+        message: err.message || String(err),
+      });
+    }
     return { success: false, reason: err.message };
-  } finally {
-    try {
-      fs.unlinkSync(tempWebm);
-    } catch (_) {}
   }
 }
 );
@@ -727,7 +889,10 @@ ipcMain.handle('settings-set', (_event, nextSettings) => {
     nextSettings?.burnSubtitlesIntoVideo
   );
   appSettings.recordingQuality =
-    nextSettings?.recordingQuality === 'compact' ? 'compact' : 'normal';
+    nextSettings?.recordingQuality === 'balance' ||
+    nextSettings?.recordingQuality === 'high'
+      ? nextSettings.recordingQuality
+      : 'normal';
 
   const rawLang =
     typeof nextSettings?.sttSourceLanguage === 'string'
@@ -769,13 +934,11 @@ ipcMain.handle('settings-set', (_event, nextSettings) => {
       ? Math.min(60, rawAutoMins)
       : appSettings.autoStopSilenceMinutes;
   appSettings.autoStopAudioSource =
-    typeof nextSettings?.autoStopAudioSource === 'string'
-      ? nextSettings.autoStopAudioSource
-      : appSettings.autoStopAudioSource;
+    nextSettings?.autoStopAudioSource === 'mic' ? 'mic' : 'system';
   appSettings.autoStopMicDeviceId =
     typeof nextSettings?.autoStopMicDeviceId === 'string'
       ? nextSettings.autoStopMicDeviceId
-      : appSettings.autoStopMicDeviceId;
+      : '';
   normalizeAutoStopSettings();
 
   saveSettings();
@@ -789,7 +952,7 @@ ipcMain.handle('get-auto-part-path', (_event, { sessionId, partIndex }) => {
     appSettings.outputFolder && fs.existsSync(appSettings.outputFolder)
       ? appSettings.outputFolder
       : desktopPath;
-  const name = `recording-${sessionId}-part${partIndex}.mp4`;
+  const name = `recording-${sessionId}-part${partIndex}.webm`;
   return { filePath: path.join(defaultFolder, name) };
 });
 
@@ -852,10 +1015,23 @@ ipcMain.handle('stt-check-config', () => {
   }
 });
 
+ipcMain.handle('audiocap-level-start', () => {
+  return startAudioCapMonitor();
+});
+
+ipcMain.handle('audiocap-level-stop', () => {
+  stopAudioCapMonitor();
+  return { ok: true };
+});
+
 // ── IPC: Window controls ────────────────────────────────────────────────────
 
 ipcMain.on('window-minimize', () => mainWindow?.minimize());
 ipcMain.on('window-close', () => mainWindow?.close());
+
+app.on('before-quit', () => {
+  stopAudioCapMonitor(true);
+});
 
 module.exports = {
   __test: {

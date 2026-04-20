@@ -272,11 +272,16 @@
       <label class="auto-stop-minutes-label" for="input-auto-stop-minutes">after</label>
       <input type="number" id="input-auto-stop-minutes" class="auto-stop-minutes-input" min="0.5" max="60" step="0.5" value="3" />
       <span class="auto-stop-minutes-label">min no audio</span>
-      <select id="select-auto-stop-source-quick" class="auto-stop-source-quick" title="Idle detection source">
-        <option value="system">System only</option>
-        <option value="mic">Mic only</option>
-        <option value="both">System + Mic</option>
+      <select id="select-auto-stop-source-quick" class="auto-stop-source-quick" title="Audio source for idle detection">
+        <option value="system">Audio source: System (captured source)</option>
       </select>
+      <progress
+        id="auto-stop-meter-quick"
+        class="auto-stop-meter-quick"
+        max="1"
+        value="0"
+        title="Audio level from selected auto-stop source"
+      ></progress>
     </div>
   </section>
 
@@ -409,38 +414,16 @@
       <input id="input-max-segment-mb" class="settings-input" type="number" min="0" step="1" placeholder="0 = no split (e.g. 20)" />
       <p class="settings-hint">When set (e.g. 20), recording splits into part1, part2… in the output folder. 0 = single file (save dialog).</p>
 
-      <h4 class="settings-section-title">Auto-stop when no audio</h4>
-      <label class="settings-check-row">
-        <input type="checkbox" id="settings-check-auto-stop" />
-        <span>Auto-stop after no audio from mic/system (per your toggles)</span>
-      </label>
-      <label class="settings-label" for="settings-input-auto-stop-minutes">No-audio duration (minutes)</label>
-      <input id="settings-input-auto-stop-minutes" class="settings-input" type="number" min="0.5" max="60" step="0.5" value="3" />
-      <label class="settings-label" for="settings-select-auto-stop-source">Audio source for idle detection</label>
-      <select id="settings-select-auto-stop-source" class="settings-input">
-        <option value="both">Both — recorded audio + chosen mic</option>
-        <option value="system">Recorded audio only (system/mixed)</option>
-        <option value="mic">Microphone only (selected below)</option>
-      </select>
-      <label class="settings-label" for="settings-select-auto-stop-mic">Microphone device (for idle detection)</label>
-      <select id="settings-select-auto-stop-mic" class="settings-input">
-        <option value="">Default microphone</option>
-      </select>
-      <div class="settings-row settings-row--meter">
-        <div class="audio-meter" id="auto-stop-meter" aria-label="Idle detection audio level">
-          <div class="audio-meter-bar" id="auto-stop-meter-bar"></div>
-        </div>
-        <span class="audio-meter-label" id="auto-stop-meter-label">Level</span>
-      </div>
       <p class="settings-hint">When enabled, recording stops and saves if there is no audible input from the captured audio (microphone and/or system audio, depending on what you turned on) for this long. With Speech-to-Text, the subtitle mic is included so talking still resets the timer.</p>
 
       <h4 class="settings-section-title">Recording</h4>
       <label class="settings-label" for="select-recording-quality">Quality / file size</label>
       <select id="select-recording-quality" class="settings-input">
+        <option value="balance">Balance — lighter file, keeps UI/text clear</option>
         <option value="normal">Normal — balanced quality and size</option>
-        <option value="compact">Smaller file — still clear for UI and slides; fast motion may look a bit softer</option>
+        <option value="high">High quality — sharper motion, larger file size</option>
       </select>
-      <p class="settings-hint">Applies to capture bitrate and MP4 encoding. Compact keeps text and typical screen content readable.</p>
+      <p class="settings-hint">Applies to capture bitrate. Compact keeps text and typical screen content readable.</p>
 
       <h4 class="settings-section-title">Subtitle (preview)</h4>
       <label class="settings-label" for="input-subtitle-size">Font size (px)</label>
@@ -472,9 +455,9 @@
 
       <label class="settings-check-row">
         <input type="checkbox" id="check-burn-subtitles" />
-        <span>Burn subtitles into video after export (extra encoding step)</span>
+        <span>Export subtitles as sidecar file (.srt/.vtt)</span>
       </label>
-      <p class="settings-hint">When enabled, creates a second MP4 with subtitles burned in (e.g. name.burned.mp4) when subtitles exist.</p>
+      <p class="settings-hint">Subtitles are exported as sidecar files (.srt/.vtt) next to the WebM video.</p>
 
       <div class="settings-actions">
         <button id="btn-settings-cancel" class="settings-btn">Cancel</button>
@@ -486,7 +469,8 @@
   <div class="burn-modal hidden" id="save-modal" role="dialog" aria-modal="true" aria-live="polite" aria-label="Saving recording">
     <div class="burn-modal-card">
       <h3 class="burn-modal-title" id="save-modal-title">Saving recording</h3>
-      <p class="burn-modal-status" id="save-modal-status">Converting to MP4…</p>
+      <p class="burn-modal-status" id="save-modal-status">Saving WebM…</p>
+      <p class="burn-modal-path hidden" id="save-modal-elapsed"></p>
       <div class="burn-modal-bar-wrap">
         <div class="burn-modal-bar" id="save-modal-bar"></div>
       </div>

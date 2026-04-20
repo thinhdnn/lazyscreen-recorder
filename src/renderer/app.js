@@ -27,10 +27,25 @@ let silenceMonitorAnalysers = [];
 let silenceMonitorInterval = null;
 let silenceStartedAt = null;
 let autoStopSilenceMs = 3 * 60 * 1000;
-let autoStopSelectedSource = 'both';
+let autoStopSelectedSource = 'system';
 let autoStopSelectedMicDeviceId = '';
-let autoStopPreviewMicStream = null;
-let autoStopMeterRaf = null;
+let autoStopSelectedSystemSourceId = '';
+let autoStopExtraStreams = [];
+let autoStopMeterSmoothedLevel = 0;
+let autoStopPreviewCtx = null;
+let autoStopPreviewAnalyser = null;
+let autoStopPreviewInterval = null;
+let autoStopPreviewStream = null;
+let autoStopAudioCapRms = 0;
+let autoStopAudioCapMonitorPreview = false;
+let autoStopAudioCapMonitorSilence = false;
+let audioCapPcmBridgeNeeded = false;
+let audioCapBridgeCtx = null;
+let audioCapBridgeScriptNode = null;
+let audioCapBridgeDestNode = null;
+let audioCapBridgeMuteNode = null;
+let audioCapBridgeSampleQueue = [];
+let audioCapBridgeQueueOffset = 0;
 
 const SUBTITLE_FONT_STACKS = {
   'system-ui':
@@ -47,15 +62,21 @@ let recordingSessionId = 0;
 let segmentPartIndex = 1;
 let segmentByteSize = 0;
 let maxSegmentBytes = 0;
-let splitPending = false;
+let segmentStartElapsedMs = 0;
 let userStoppedRecording = false;
 let recordingMimeType = '';
 let recordingVideoBitrate = 2_500_000;
 /** Mic stream used only for live STT — never mixed into the recorded file */
 let sttDedicatedMicStream = null;
+let saveConversionStartedAtMs = 0;
+let saveConversionElapsedTimer = null;
+let recorderStopReason = 'idle';
+let segmentRotateInFlight = false;
 
 function videoBitrateForRecordingQuality(q) {
-  return q === 'compact' ? 1_400_000 : 2_500_000;
+  if (q === 'balance') return 3_000_000;
+  if (q === 'high') return 8_000_000;
+  return 5_000_000;
 }
 
 const {
@@ -125,6 +146,7 @@ const subtitleEdit = $('#subtitle-edit');
 const saveModal = $('#save-modal');
 const saveModalStatus = $('#save-modal-status');
 const saveModalBar = $('#save-modal-bar');
+const saveModalElapsed = $('#save-modal-elapsed');
 const saveModalPath = $('#save-modal-path');
 const saveModalClose = $('#save-modal-close');
 const burnModal = $('#burn-modal');
@@ -151,15 +173,66 @@ const toggleAutoStopSilence = $('#toggle-auto-stop-silence');
 const autoStopMinutesWrap = $('#auto-stop-minutes-wrap');
 const inputAutoStopMinutes = $('#input-auto-stop-minutes');
 const selectAutoStopSourceQuick = $('#select-auto-stop-source-quick');
+const autoStopMeterQuick = $('#auto-stop-meter-quick');
 const autoStopCountdown = $('#auto-stop-countdown');
-const settingsCheckAutoStop = $('#settings-check-auto-stop');
-const settingsInputAutoStopMinutes = $('#settings-input-auto-stop-minutes');
-const settingsSelectAutoStopSource = $('#settings-select-auto-stop-source');
-const settingsSelectAutoStopMic = $('#settings-select-auto-stop-mic');
-const autoStopMeterBar = $('#auto-stop-meter-bar');
-const autoStopMeterLabel = $('#auto-stop-meter-label');
 const sttApiKeyMissingAlert =
   'Soniox API key is missing. Add it in Settings to enable Speech-to-Text.';
+
+window.electronAPI.onAudioCapLevel?.((payload) => {
+  const rms = Number(payload?.rms);
+  autoStopAudioCapRms = Number.isFinite(rms) ? Math.max(0, rms) : 0;
+  if (
+    autoStopAudioCapRms > 0 &&
+    typeof status?.textContent === 'string' &&
+    status.textContent.startsWith('System audio monitor error:')
+  ) {
+    status.textContent = document.body.classList.contains('recording')
+      ? recordingStatusMessage()
+      : 'Ready';
+  }
+});
+
+window.electronAPI.onAudioCapPcm?.((payload) => {
+  if (!audioCapBridgeCtx) return;
+  const chunk = payload?.chunk;
+  if (!chunk) return;
+  const u8 = chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk);
+  const sampleCount = Math.floor(u8.length / 2);
+  if (sampleCount <= 0) return;
+  const input = new Float32Array(sampleCount);
+  for (let i = 0; i < sampleCount; i += 1) {
+    const lo = u8[i * 2];
+    const hi = u8[i * 2 + 1];
+    const int16 = (hi << 8) | lo;
+    const signed = int16 >= 0x8000 ? int16 - 0x10000 : int16;
+    input[i] = signed / 32768;
+  }
+  const srcRate = 16000;
+  const dstRate = audioCapBridgeCtx.sampleRate || 48000;
+  if (dstRate === srcRate) {
+    audioCapBridgeSampleQueue.push(input);
+    return;
+  }
+  const outLen = Math.max(1, Math.floor((input.length * dstRate) / srcRate));
+  const out = new Float32Array(outLen);
+  for (let i = 0; i < outLen; i += 1) {
+    const srcPos = (i * srcRate) / dstRate;
+    const idx = Math.floor(srcPos);
+    const frac = srcPos - idx;
+    const a = input[Math.min(idx, input.length - 1)];
+    const b = input[Math.min(idx + 1, input.length - 1)];
+    out[i] = a + (b - a) * frac;
+  }
+  audioCapBridgeSampleQueue.push(out);
+});
+
+window.electronAPI.onAudioCapLevelError?.((payload) => {
+  autoStopAudioCapRms = 0;
+  if (toggleAutoStopSilence.checked && autoStopSelectedSource === 'system') {
+    status.textContent =
+      `System audio monitor error: ${payload?.reason || 'audiocap unavailable'}`;
+  }
+});
 
 function syncThemeButtonChrome() {
   if (!btnTheme) return;
@@ -381,6 +454,11 @@ toggleAutoStopSilence.addEventListener('change', async () => {
     ...cur,
     autoStopOnSilence: enabled,
   });
+  if (enabled) {
+    await startAutoStopSourcePreviewMonitor();
+  } else {
+    stopAutoStopSourcePreviewMonitor();
+  }
 });
 
 inputAutoStopMinutes.addEventListener('change', async () => {
@@ -394,66 +472,242 @@ inputAutoStopMinutes.addEventListener('change', async () => {
   });
 });
 
-function setAutoStopMeterLevel01(level) {
-  const pct = Math.round(Math.min(1, Math.max(0, level)) * 100);
-  if (autoStopMeterBar) autoStopMeterBar.style.width = `${pct}%`;
-  if (autoStopMeterLabel) autoStopMeterLabel.textContent = `${pct}%`;
+function syncAutoStopSystemSourcePickers(value) {
+  autoStopSelectedSystemSourceId = value || '';
 }
 
-async function stopAutoStopPreviewMic() {
-  if (autoStopMeterRaf) {
-    cancelAnimationFrame(autoStopMeterRaf);
-    autoStopMeterRaf = null;
+function updateAutoStopMeterLevel(rawRms = 0, { smooth = true } = {}) {
+  if (!autoStopMeterQuick) return;
+  const rms = Number.isFinite(rawRms) ? Math.max(0, rawRms) : 0;
+  // RMS is usually very small (speech/music often < 0.1). Scale and smooth for readable UI.
+  const normalized = Math.min(1, rms * 12);
+  if (smooth) {
+    autoStopMeterSmoothedLevel =
+      autoStopMeterSmoothedLevel * 0.72 + normalized * 0.28;
+  } else {
+    autoStopMeterSmoothedLevel = normalized;
   }
-  if (autoStopPreviewMicStream) {
-    autoStopPreviewMicStream.getTracks().forEach((t) => t.stop());
-    autoStopPreviewMicStream = null;
-  }
-  setAutoStopMeterLevel01(0);
+  autoStopMeterQuick.value = autoStopMeterSmoothedLevel;
 }
 
-async function startAutoStopPreviewMic(deviceId) {
-  await stopAutoStopPreviewMic();
+async function syncAudioCapMonitorLifecycle() {
+  const shouldRun =
+    autoStopAudioCapMonitorPreview ||
+    autoStopAudioCapMonitorSilence ||
+    audioCapPcmBridgeNeeded;
+  if (shouldRun) {
+    const res = await window.electronAPI.startAudioCapLevelMonitor();
+    if (!res?.ok) {
+      autoStopAudioCapRms = 0;
+      if (res?.reason === 'audiocap-not-found') {
+        status.textContent =
+          'System audio helper (audiocap) not found. Please run "npm run setup:audiocap" and restart LazyScreen Recorder.';
+      } else if (res?.reason === 'unsupported-platform') {
+        status.textContent = 'System audio monitor is only available on macOS and Windows.';
+      } else {
+        status.textContent =
+          'Failed to start system audio monitor. Try turning Auto-stop off and on, then check your setup.';
+      }
+    }
+    return;
+  }
+  await window.electronAPI.stopAudioCapLevelMonitor();
+  autoStopAudioCapRms = 0;
+}
+
+function teardownAudioCapPcmBridge() {
+  if (audioCapBridgeScriptNode) {
+    try {
+      audioCapBridgeScriptNode.disconnect();
+    } catch (_) {}
+    audioCapBridgeScriptNode.onaudioprocess = null;
+    audioCapBridgeScriptNode = null;
+  }
+  if (audioCapBridgeMuteNode) {
+    try {
+      audioCapBridgeMuteNode.disconnect();
+    } catch (_) {}
+    audioCapBridgeMuteNode = null;
+  }
+  audioCapBridgeDestNode = null;
+  audioCapBridgeSampleQueue = [];
+  audioCapBridgeQueueOffset = 0;
+  if (audioCapBridgeCtx) {
+    audioCapBridgeCtx.close().catch(() => {});
+    audioCapBridgeCtx = null;
+  }
+}
+
+async function ensureAudioCapPcmBridgeStream() {
+  audioCapPcmBridgeNeeded = true;
+  const res = await window.electronAPI.startAudioCapLevelMonitor();
+  if (!res?.ok) {
+    audioCapPcmBridgeNeeded = false;
+    await syncAudioCapMonitorLifecycle();
+    if (res?.reason === 'audiocap-not-found') {
+      throw new Error(
+        'System audio helper (audiocap) not found. Run "npm run setup:audiocap" then restart LazyScreen Recorder.'
+      );
+    }
+    if (res?.reason === 'unsupported-platform') {
+      throw new Error('Recording system audio is only supported on macOS and Windows.');
+    }
+    throw new Error(
+      'Failed to start system audio helper (audiocap). Close the app, verify your setup, then try again.'
+    );
+  }
+  if (audioCapBridgeDestNode?.stream) {
+    return audioCapBridgeDestNode.stream;
+  }
+  audioCapBridgeCtx = new AudioContext({ sampleRate: 48000 });
+  audioCapBridgeDestNode = audioCapBridgeCtx.createMediaStreamDestination();
+  audioCapBridgeScriptNode = audioCapBridgeCtx.createScriptProcessor(4096, 0, 1);
+  audioCapBridgeMuteNode = audioCapBridgeCtx.createGain();
+  audioCapBridgeMuteNode.gain.value = 0;
+  audioCapBridgeScriptNode.connect(audioCapBridgeDestNode);
+  audioCapBridgeScriptNode.connect(audioCapBridgeMuteNode);
+  audioCapBridgeMuteNode.connect(audioCapBridgeCtx.destination);
+  audioCapBridgeScriptNode.onaudioprocess = (event) => {
+    const output = event.outputBuffer.getChannelData(0);
+    let writePos = 0;
+    while (writePos < output.length) {
+      if (audioCapBridgeSampleQueue.length === 0) {
+        output.fill(0, writePos);
+        break;
+      }
+      const head = audioCapBridgeSampleQueue[0];
+      const remain = head.length - audioCapBridgeQueueOffset;
+      const take = Math.min(remain, output.length - writePos);
+      output.set(
+        head.subarray(audioCapBridgeQueueOffset, audioCapBridgeQueueOffset + take),
+        writePos
+      );
+      writePos += take;
+      audioCapBridgeQueueOffset += take;
+      if (audioCapBridgeQueueOffset >= head.length) {
+        audioCapBridgeSampleQueue.shift();
+        audioCapBridgeQueueOffset = 0;
+      }
+    }
+  };
+  return audioCapBridgeDestNode.stream;
+}
+
+function stopAutoStopSourcePreviewMonitor() {
+  if (autoStopPreviewInterval) {
+    clearInterval(autoStopPreviewInterval);
+    autoStopPreviewInterval = null;
+  }
+  autoStopPreviewAnalyser = null;
+  if (autoStopPreviewCtx) {
+    autoStopPreviewCtx.close().catch(() => {});
+    autoStopPreviewCtx = null;
+  }
+  if (autoStopPreviewStream) {
+    autoStopPreviewStream.getTracks().forEach((t) => t.stop());
+    autoStopPreviewStream = null;
+  }
+  autoStopAudioCapMonitorPreview = false;
+  void syncAudioCapMonitorLifecycle();
+  autoStopMeterSmoothedLevel = 0;
+  updateAutoStopMeterLevel(0);
+}
+
+async function startAutoStopSourcePreviewMonitor() {
+  if (!toggleAutoStopSilence.checked || mediaRecorder) {
+    stopAutoStopSourcePreviewMonitor();
+    return;
+  }
+  stopAutoStopSourcePreviewMonitor();
+
   try {
-    const perm = await window.electronAPI.requestMicrophonePermission();
-    if (!perm.ok) return;
-    autoStopPreviewMicStream = await navigator.mediaDevices.getUserMedia({
-      audio: deviceId ? { deviceId: { exact: deviceId } } : true,
-      video: false,
-    });
-    const ctx = new AudioContext();
-    const src = ctx.createMediaStreamSource(autoStopPreviewMicStream);
-    const an = ctx.createAnalyser();
-    an.fftSize = 1024;
-    src.connect(an);
-    const buf = new Float32Array(an.fftSize);
-    const tick = () => {
-      an.getFloatTimeDomainData(buf);
-      const rms = computeRmsFloat32(buf);
-      // Map RMS ~0..0.2 to 0..1 for UI
-      setAutoStopMeterLevel01(Math.min(1, rms / 0.2));
-      autoStopMeterRaf = requestAnimationFrame(tick);
-    };
-    tick();
-  } catch (_) {
-    // ignore
+    let stream = null;
+    if (autoStopSelectedSource === 'mic') {
+      const perm = await window.electronAPI.requestMicrophonePermission();
+      if (!perm.ok) return;
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: autoStopSelectedMicDeviceId
+          ? { deviceId: { exact: autoStopSelectedMicDeviceId } }
+          : true,
+        video: false,
+      });
+      autoStopPreviewStream = stream;
+    } else {
+      autoStopAudioCapMonitorPreview = true;
+      await syncAudioCapMonitorLifecycle();
+      autoStopPreviewInterval = setInterval(() => {
+        updateAutoStopMeterLevel(autoStopAudioCapRms);
+      }, 180);
+      return;
+    }
+
+    if (!stream || stream.getAudioTracks().length === 0) return;
+    autoStopPreviewCtx = new AudioContext();
+    const src = autoStopPreviewCtx.createMediaStreamSource(stream);
+    autoStopPreviewAnalyser = autoStopPreviewCtx.createAnalyser();
+    autoStopPreviewAnalyser.fftSize = 2048;
+    src.connect(autoStopPreviewAnalyser);
+    const data = new Float32Array(autoStopPreviewAnalyser.fftSize);
+    autoStopPreviewInterval = setInterval(() => {
+      if (!autoStopPreviewAnalyser) return;
+      autoStopPreviewAnalyser.getFloatTimeDomainData(data);
+      updateAutoStopMeterLevel(computeRmsFloat32(data));
+    }, 180);
+  } catch (err) {
+    console.warn('[auto-stop preview] source monitor failed:', err);
+    stopAutoStopSourcePreviewMonitor();
   }
 }
 
-async function refreshAutoStopMicDevices(selectedId) {
-  if (!settingsSelectAutoStopMic) return;
+function autoStopSelectValueForMicDeviceId(deviceId) {
+  return deviceId ? `mic:${deviceId}` : 'system';
+}
+
+function autoStopSelectionFromSelectValue(value) {
+  if (typeof value === 'string' && value.startsWith('mic:')) {
+    return {
+      source: 'mic',
+      micDeviceId: value.slice(4),
+    };
+  }
+  return {
+    source: 'system',
+    micDeviceId: '',
+  };
+}
+
+async function refreshAutoStopSourceOptions() {
+  if (!selectAutoStopSourceQuick || !navigator.mediaDevices?.enumerateDevices) {
+    return;
+  }
+
+  const selectedValue = autoStopSelectValueForMicDeviceId(
+    autoStopSelectedSource === 'mic' ? autoStopSelectedMicDeviceId : ''
+  );
   const devices = await navigator.mediaDevices.enumerateDevices();
-  const mics = devices.filter((d) => d.kind === 'audioinput');
-  const cur = settingsSelectAutoStopMic.value;
-  settingsSelectAutoStopMic.innerHTML = '<option value=\"\">Default microphone</option>';
-  mics.forEach((d, idx) => {
+  const audioInputs = devices.filter((d) => d.kind === 'audioinput');
+  selectAutoStopSourceQuick.innerHTML = '';
+
+  const systemOption = document.createElement('option');
+  systemOption.value = 'system';
+  systemOption.textContent = 'Audio source: System (captured source)';
+  selectAutoStopSourceQuick.appendChild(systemOption);
+
+  audioInputs.forEach((input, index) => {
     const opt = document.createElement('option');
-    opt.value = d.deviceId;
-    opt.textContent = d.label || `Microphone ${idx + 1}`;
-    settingsSelectAutoStopMic.appendChild(opt);
+    opt.value = `mic:${input.deviceId}`;
+    opt.textContent =
+      input.label || `Audio source: Microphone ${index + 1}`;
+    selectAutoStopSourceQuick.appendChild(opt);
   });
-  const next = selectedId ?? cur;
-  if (next) settingsSelectAutoStopMic.value = next;
+
+  const hasSelected = Array.from(selectAutoStopSourceQuick.options).some(
+    (opt) => opt.value === selectedValue
+  );
+  selectAutoStopSourceQuick.value = hasSelected ? selectedValue : 'system';
+  const resolved = autoStopSelectionFromSelectValue(selectAutoStopSourceQuick.value);
+  autoStopSelectedSource = resolved.source;
+  autoStopSelectedMicDeviceId = resolved.micDeviceId;
 }
 
 toggleMic.addEventListener('change', async () => {
@@ -476,27 +730,36 @@ toggleMic.addEventListener('change', async () => {
   const mins = Number(s.autoStopSilenceMinutes) || 3;
   inputAutoStopMinutes.value = mins;
   autoStopSilenceMs = mins * 60 * 1000;
-  autoStopSelectedSource =
-    s.autoStopAudioSource === 'system' || s.autoStopAudioSource === 'mic'
-      ? s.autoStopAudioSource
-      : 'both';
+  autoStopSelectedSource = s.autoStopAudioSource === 'mic' ? 'mic' : 'system';
   autoStopSelectedMicDeviceId =
     typeof s.autoStopMicDeviceId === 'string' ? s.autoStopMicDeviceId : '';
-  if (selectAutoStopSourceQuick) {
-    selectAutoStopSourceQuick.value = autoStopSelectedSource;
-  }
+  autoStopSelectedSystemSourceId = '';
+  await refreshAutoStopSourceOptions();
+  syncAutoStopSystemSourcePickers(autoStopSelectedSystemSourceId);
   autoStopMinutesWrap.classList.toggle('hidden', !toggleAutoStopSilence.checked);
 })();
 
 selectAutoStopSourceQuick?.addEventListener('change', async () => {
-  const v = selectAutoStopSourceQuick.value;
-  autoStopSelectedSource = v === 'system' || v === 'mic' ? v : 'both';
+  const selection = autoStopSelectionFromSelectValue(selectAutoStopSourceQuick.value);
+  autoStopSelectedSource = selection.source;
+  autoStopSelectedMicDeviceId = selection.micDeviceId;
   const cur = await window.electronAPI.getSettings();
   await window.electronAPI.saveSettings({
     ...cur,
     autoStopAudioSource: autoStopSelectedSource,
+    autoStopMicDeviceId: autoStopSelectedMicDeviceId,
   });
+  await startAutoStopSourcePreviewMonitor();
 });
+
+navigator.mediaDevices?.addEventListener?.('devicechange', () => {
+  void (async () => {
+    await refreshAutoStopSourceOptions();
+    await startAutoStopSourcePreviewMonitor();
+  })();
+});
+
+// System source picker was removed from UI; keep using current recording source.
 
 (async function syncSttToggleWithSettings() {
   const config = await window.electronAPI.checkSttConfig();
@@ -560,27 +823,17 @@ btnSettings.addEventListener('click', async () => {
   );
   checkBurnSubtitles.checked = Boolean(settings.burnSubtitlesIntoVideo);
   selectRecordingQuality.value =
-    settings.recordingQuality === 'compact' ? 'compact' : 'normal';
-  settingsCheckAutoStop.checked = Boolean(settings.autoStopOnSilence);
-  settingsInputAutoStopMinutes.value = String(
-    typeof settings.autoStopSilenceMinutes === 'number'
-      ? settings.autoStopSilenceMinutes
-      : 3
-  );
-  settingsSelectAutoStopSource.value =
-    settings.autoStopAudioSource === 'system' || settings.autoStopAudioSource === 'mic'
-      ? settings.autoStopAudioSource
-      : 'both';
-  if (selectAutoStopSourceQuick) {
-    selectAutoStopSourceQuick.value = settingsSelectAutoStopSource.value;
-  }
-  await refreshAutoStopMicDevices(settings.autoStopMicDeviceId || '');
-  // Start mic meter preview only when source includes mic
-  if (settingsSelectAutoStopSource.value === 'mic' || settingsSelectAutoStopSource.value === 'both') {
-    await startAutoStopPreviewMic(settingsSelectAutoStopMic.value);
-  } else {
-    await stopAutoStopPreviewMic();
-  }
+    settings.recordingQuality === 'balance' || settings.recordingQuality === 'high'
+      ? settings.recordingQuality
+      : 'normal';
+  autoStopSelectedSource =
+    settings.autoStopAudioSource === 'mic' ? 'mic' : 'system';
+  autoStopSelectedMicDeviceId =
+    typeof settings.autoStopMicDeviceId === 'string'
+      ? settings.autoStopMicDeviceId
+      : '';
+  await refreshAutoStopSourceOptions();
+  syncAutoStopSystemSourcePickers('');
   const sttLang = settings.sttSourceLanguage || '';
   selectSttSourceLanguage.value = sttLang;
   checkSttLangStrict.checked = Boolean(settings.sttLanguageHintsStrict);
@@ -602,28 +855,11 @@ btnPickOutputFolder.addEventListener('click', async () => {
 
 btnSettingsCancel.addEventListener('click', () => {
   settingsModal.classList.add('hidden');
-  void stopAutoStopPreviewMic();
 });
 
 settingsModal.addEventListener('click', (e) => {
   if (e.target === settingsModal) {
     settingsModal.classList.add('hidden');
-    void stopAutoStopPreviewMic();
-  }
-});
-
-settingsSelectAutoStopSource?.addEventListener('change', async () => {
-  if (settingsSelectAutoStopSource.value === 'mic' || settingsSelectAutoStopSource.value === 'both') {
-    await refreshAutoStopMicDevices(settingsSelectAutoStopMic.value);
-    await startAutoStopPreviewMic(settingsSelectAutoStopMic.value);
-  } else {
-    await stopAutoStopPreviewMic();
-  }
-});
-
-settingsSelectAutoStopMic?.addEventListener('change', async () => {
-  if (settingsSelectAutoStopSource.value === 'mic' || settingsSelectAutoStopSource.value === 'both') {
-    await startAutoStopPreviewMic(settingsSelectAutoStopMic.value);
   }
 });
 
@@ -651,14 +887,10 @@ btnSettingsSave.addEventListener('click', async () => {
     ),
     burnSubtitlesIntoVideo: checkBurnSubtitles.checked,
     recordingQuality:
-      selectRecordingQuality.value === 'compact' ? 'compact' : 'normal',
-    autoStopOnSilence: settingsCheckAutoStop.checked,
-    autoStopSilenceMinutes: Math.max(
-      0.5,
-      Math.min(60, Number(settingsInputAutoStopMinutes.value) || 3)
-    ),
-    autoStopAudioSource: settingsSelectAutoStopSource?.value || 'both',
-    autoStopMicDeviceId: settingsSelectAutoStopMic?.value || '',
+      selectRecordingQuality.value === 'balance' ||
+      selectRecordingQuality.value === 'high'
+        ? selectRecordingQuality.value
+        : 'normal',
     sttSourceLanguage: selectSttSourceLanguage.value || '',
     sttLanguageHintsStrict: checkSttLangStrict.checked,
     sttTranslationTargetLanguage: selectSttTranslationTargetLanguage.value || '',
@@ -680,22 +912,14 @@ btnSettingsSave.addEventListener('click', async () => {
   } else {
     await applySubtitleAppearance();
   }
-  toggleAutoStopSilence.checked = settingsCheckAutoStop.checked;
-  const savedMins = Math.max(
-    0.5,
-    Math.min(60, Number(settingsInputAutoStopMinutes.value) || 3)
-  );
-  inputAutoStopMinutes.value = savedMins;
-  autoStopSilenceMs = savedMins * 60 * 1000;
-  autoStopMinutesWrap.classList.toggle('hidden', !toggleAutoStopSilence.checked);
-  autoStopSelectedSource = settingsSelectAutoStopSource?.value || 'both';
-  autoStopSelectedMicDeviceId = settingsSelectAutoStopMic?.value || '';
   if (selectAutoStopSourceQuick) {
-    selectAutoStopSourceQuick.value = autoStopSelectedSource;
+    selectAutoStopSourceQuick.value = autoStopSelectValueForMicDeviceId(
+      autoStopSelectedSource === 'mic' ? autoStopSelectedMicDeviceId : ''
+    );
   }
+  syncAutoStopSystemSourcePickers(autoStopSelectedSystemSourceId);
 
   settingsModal.classList.add('hidden');
-  void stopAutoStopPreviewMic();
   status.textContent = 'Settings saved';
   const sttOk = await window.electronAPI.checkSttConfig();
   if (!sttOk.ok && toggleStt.checked) {
@@ -779,6 +1003,7 @@ tabs.forEach((tab) => {
     tab.setAttribute('aria-selected', 'true');
     currentMode = tab.dataset.mode;
     selectedSource = null;
+    stopAutoStopSourcePreviewMonitor();
     areaRect = null;
     updateView();
   });
@@ -831,7 +1056,7 @@ async function loadSources() {
 function renderFlatSources(sources) {
   sourcesGrid.className = 'sources-grid';
   sources.forEach((source) => {
-    sourcesGrid.appendChild(createSourceCard(source));
+    sourcesGrid.appendChild(createSourceCard(source, { compact: false }));
   });
 }
 
@@ -855,6 +1080,7 @@ function renderGroupedSources(sources) {
     const appSources = groups[appName];
     const group = document.createElement('div');
     group.className = 'app-group';
+    group.classList.add('collapsed');
 
     const iconSrc = appSources[0].appIcon;
     const iconHtml = iconSrc
@@ -880,7 +1106,7 @@ function renderGroupedSources(sources) {
     content.className = 'app-group-content';
 
     for (const source of appSources) {
-      content.appendChild(createSourceCard(source));
+      content.appendChild(createSourceCard(source, { compact: true }));
     }
 
     group.appendChild(header);
@@ -889,20 +1115,26 @@ function renderGroupedSources(sources) {
   }
 }
 
-function createSourceCard(source) {
+function createSourceCard(source, { compact = false } = {}) {
   const card = document.createElement('div');
   card.className = 'source-card';
+  if (compact) card.classList.add('source-card--compact');
   card.dataset.sourceId = source.id;
 
   const iconHtml =
     source.appIcon
       ? `<img class="app-icon" src="${source.appIcon}" />`
       : '';
-
-  card.innerHTML = `
-    <img class="thumb" src="${source.thumbnail}" alt="${source.name}" />
-    <div class="source-name">${iconHtml}<span>${source.name}</span></div>
-  `;
+  if (compact) {
+    card.innerHTML = `
+      <div class="source-name">${iconHtml}<span>${source.name}</span></div>
+    `;
+  } else {
+    card.innerHTML = `
+      <img class="thumb" src="${source.thumbnail}" alt="${source.name}" />
+      <div class="source-name">${iconHtml}<span>${source.name}</span></div>
+    `;
+  }
 
   card.addEventListener('click', () => {
     document
@@ -912,6 +1144,7 @@ function createSourceCard(source) {
     selectedSource = source;
     updateRecordButton();
     showPreview();
+    void startAutoStopSourcePreviewMonitor();
   });
 
   return card;
@@ -974,6 +1207,7 @@ btnPreviewBack.addEventListener('click', () => {
     areaInfo.classList.remove('hidden');
   } else {
     selectedSource = null;
+    stopAutoStopSourcePreviewMonitor();
     updateRecordButton();
     sourcePicker.classList.remove('hidden');
   }
@@ -1330,9 +1564,12 @@ function updateRecordButton() {
 const SILENCE_RMS_THRESHOLD = 0.013;
 const SILENCE_CHECK_INTERVAL_MS = 2000;
 
-function startSilenceMonitor({ recordStream, sttMicStream }) {
+function startSilenceMonitor({ recordStream, sttMicStream, systemViaAudioCap = false }) {
   stopSilenceMonitor();
-
+  autoStopAudioCapMonitorSilence = Boolean(systemViaAudioCap);
+  if (autoStopAudioCapMonitorSilence) {
+    void syncAudioCapMonitorLifecycle();
+  }
   silenceMonitorCtx = new AudioContext();
 
   const addBranch = (stream) => {
@@ -1352,7 +1589,7 @@ function startSilenceMonitor({ recordStream, sttMicStream }) {
   addBranch(recordStream);
   addBranch(sttMicStream);
 
-  if (silenceMonitorAnalysers.length === 0) {
+  if (silenceMonitorAnalysers.length === 0 && !systemViaAudioCap) {
     silenceMonitorCtx.close().catch(() => {});
     silenceMonitorCtx = null;
     silenceMonitorSources = [];
@@ -1363,15 +1600,20 @@ function startSilenceMonitor({ recordStream, sttMicStream }) {
     (a) => new Float32Array(a.fftSize)
   );
   silenceStartedAt = null;
+  autoStopMeterSmoothedLevel = 0;
+  updateAutoStopMeterLevel(0);
 
   silenceMonitorInterval = setInterval(() => {
     if (!mediaRecorder || mediaRecorder.state !== 'recording') return;
 
-    let maxRms = 0;
+    let maxRms = systemViaAudioCap ? autoStopAudioCapRms : 0;
     for (let i = 0; i < silenceMonitorAnalysers.length; i += 1) {
       silenceMonitorAnalysers[i].getFloatTimeDomainData(dataArrays[i]);
       maxRms = Math.max(maxRms, computeRmsFloat32(dataArrays[i]));
     }
+    // During recording, meter should closely match the threshold logic
+    // to avoid "visible meter but still no audio" confusion.
+    updateAutoStopMeterLevel(maxRms, { smooth: false });
 
     if (maxRms < SILENCE_RMS_THRESHOLD) {
       if (silenceStartedAt === null) {
@@ -1424,6 +1666,10 @@ function stopSilenceMonitor() {
   }
   silenceMonitorSources = [];
   silenceMonitorAnalysers = [];
+  autoStopAudioCapMonitorSilence = false;
+  void syncAudioCapMonitorLifecycle();
+  autoStopMeterSmoothedLevel = 0;
+  updateAutoStopMeterLevel(0);
   if (silenceMonitorCtx) {
     silenceMonitorCtx.close().catch(() => {});
     silenceMonitorCtx = null;
@@ -1438,6 +1684,14 @@ async function stopIdleDetectorExtraMic(stream) {
   try {
     stream.getTracks().forEach((t) => t.stop());
   } catch (_) {}
+}
+
+async function stopAutoStopExtraStreams() {
+  const list = autoStopExtraStreams.slice();
+  autoStopExtraStreams = [];
+  for (const stream of list) {
+    await stopIdleDetectorExtraMic(stream);
+  }
 }
 
 /* ── Start recording ──────────────────────────────────────── */
@@ -1470,7 +1724,10 @@ function autoStopRecording() {
 
 async function startRecording() {
   try {
+    stopAutoStopSourcePreviewMonitor();
+    await stopAutoStopExtraStreams();
     let videoStream;
+    let nativeSystemAudioStream = null;
 
     if (currentMode === 'area') {
       const sources = await window.electronAPI.getSources('screen');
@@ -1507,12 +1764,29 @@ async function startRecording() {
 
     const streamConstraints = {
       audio: wantSystemAudio
-        ? { mandatory: { chromeMediaSource: 'desktop' } }
+        ? {
+            mandatory: {
+              chromeMediaSource: 'desktop',
+              chromeMediaSourceId: selectedSource.id,
+            },
+          }
         : false,
       video: videoConstraints,
     };
+    const nativeSystemPreferred = wantSystemAudio;
+    if (nativeSystemPreferred) {
+      streamConstraints.audio = false;
+    }
 
     videoStream = await navigator.mediaDevices.getUserMedia(streamConstraints);
+
+    if (wantSystemAudio) {
+      const nativeStream = await ensureAudioCapPcmBridgeStream();
+      const nativeTrack = nativeStream.getAudioTracks()[0];
+      if (nativeTrack) {
+        nativeSystemAudioStream = new MediaStream([nativeTrack.clone()]);
+      }
+    }
 
     let finalStream = videoStream;
 
@@ -1526,8 +1800,9 @@ async function startRecording() {
         // Mix system audio + mic using Web Audio API
         const ctx = new AudioContext();
         const dest = ctx.createMediaStreamDestination();
-
-        const systemSource = ctx.createMediaStreamSource(videoStream);
+        const systemSource = ctx.createMediaStreamSource(
+          nativeSystemAudioStream || videoStream
+        );
         systemSource.connect(dest);
 
         const micSource = ctx.createMediaStreamSource(micStream);
@@ -1543,20 +1818,26 @@ async function startRecording() {
         const micTrack = micStream.getAudioTracks()[0];
         finalStream = new MediaStream([videoTrack, micTrack]);
       }
+    } else if (wantSystemAudio && nativeSystemAudioStream) {
+      const videoTrack = videoStream.getVideoTracks()[0];
+      const sysTrack = nativeSystemAudioStream.getAudioTracks()[0];
+      finalStream = new MediaStream([videoTrack, sysTrack]);
     }
 
     recordedChunks = [];
 
-    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
-      ? 'video/webm;codecs=vp9,opus'
+    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp8,opus')
+      ? 'video/webm;codecs=vp8,opus'
       : 'video/webm';
 
     recordingStreamRef = finalStream;
     recordingSessionId = Date.now();
     segmentPartIndex = 1;
     segmentByteSize = 0;
+    segmentStartElapsedMs = 0;
     userStoppedRecording = false;
-    splitPending = false;
+    recorderStopReason = 'idle';
+    segmentRotateInFlight = false;
     recordingMimeType = mimeType;
 
     const settings = await window.electronAPI.getSettings();
@@ -1580,16 +1861,20 @@ async function startRecording() {
     if (toggleAutoStopSilence.checked) {
       autoStopSilenceMs =
         Math.max(0.5, Number(inputAutoStopMinutes.value) || 3) * 60 * 1000;
-      const s = await window.electronAPI.getSettings();
+      // Use the latest in-memory UI selection to avoid stale settings race
+      // when user changes source then hits Record immediately.
       autoStopSelectedSource =
-        s.autoStopAudioSource === 'system' || s.autoStopAudioSource === 'mic'
-          ? s.autoStopAudioSource
-          : 'both';
+        autoStopSelectedSource === 'mic' ? 'mic' : 'system';
       autoStopSelectedMicDeviceId =
-        typeof s.autoStopMicDeviceId === 'string' ? s.autoStopMicDeviceId : '';
+        typeof autoStopSelectedMicDeviceId === 'string'
+          ? autoStopSelectedMicDeviceId
+          : '';
+      autoStopSelectedSystemSourceId = '';
 
       let idleMicStream = null;
-      if (autoStopSelectedSource === 'mic' || autoStopSelectedSource === 'both') {
+      let idleSystemStream = null;
+      let monitorSystemViaAudioCap = false;
+      if (autoStopSelectedSource === 'mic') {
         // Prefer existing STT mic stream if present; otherwise create dedicated mic stream.
         if (sttDedicatedMicStream) {
           idleMicStream = sttDedicatedMicStream;
@@ -1606,19 +1891,26 @@ async function startRecording() {
         }
       }
 
+      if (
+        autoStopSelectedSource === 'system' &&
+        !wantSystemAudio
+      ) {
+        monitorSystemViaAudioCap = true;
+      }
+
       startSilenceMonitor({
-        recordStream: autoStopSelectedSource === 'mic' ? null : finalStream,
+        recordStream: autoStopSelectedSource === 'system'
+          ? idleSystemStream || finalStream
+          : null,
         sttMicStream: idleMicStream,
+        systemViaAudioCap: monitorSystemViaAudioCap,
       });
 
-      // Ensure this extra mic stream is stopped when recording ends.
       if (idleMicStream && idleMicStream !== sttDedicatedMicStream) {
-        const extra = idleMicStream;
-        const prevOnStop = mediaRecorder.onstop;
-        mediaRecorder.onstop = async (...args) => {
-          await stopIdleDetectorExtraMic(extra);
-          return prevOnStop?.apply(mediaRecorder, args);
-        };
+        autoStopExtraStreams.push(idleMicStream);
+      }
+      if (idleSystemStream) {
+        autoStopExtraStreams.push(idleSystemStream);
       }
     }
 
@@ -1656,6 +1948,10 @@ async function startRecording() {
   } catch (err) {
     console.error('Recording failed:', err);
     status.textContent = `Error: ${err.message}`;
+    await stopAutoStopExtraStreams();
+    audioCapPcmBridgeNeeded = false;
+    await syncAudioCapMonitorLifecycle();
+    teardownAudioCapPcmBridge();
     if (sttDedicatedMicStream) {
       sttDedicatedMicStream.getTracks().forEach((t) => t.stop());
       sttDedicatedMicStream = null;
@@ -1667,7 +1963,7 @@ async function startRecording() {
 function stopRecording() {
   if (!mediaRecorder) return;
   userStoppedRecording = true;
-  splitPending = false;
+  recorderStopReason = 'user';
   mediaRecorder.stop();
   status.textContent = 'Processing...';
 }
@@ -1728,37 +2024,30 @@ function attachMediaRecorderHandlers() {
     if (e.data.size > 0) {
       recordedChunks.push(e.data);
       segmentByteSize += e.data.size;
-      if (
-        maxSegmentBytes > 0 &&
-        segmentByteSize >= maxSegmentBytes &&
-        mediaRecorder &&
-        mediaRecorder.state === 'recording'
-      ) {
-        splitPending = true;
-        mediaRecorder.stop();
-      }
+    }
+    if (
+      maxSegmentBytes > 0 &&
+      !userStoppedRecording &&
+      !segmentRotateInFlight &&
+      mediaRecorder &&
+      mediaRecorder.state === 'recording' &&
+      segmentByteSize >= maxSegmentBytes
+    ) {
+      segmentRotateInFlight = true;
+      recorderStopReason = 'rotate';
+      mediaRecorder.requestData();
+      mediaRecorder.stop();
     }
   };
   mediaRecorder.onstop = handleRecordingStopped;
 }
 
-function getCropRectForEncode() {
-  if (currentMode === 'area' && areaRect) {
-    const cropRect = {
-      x: Math.round(areaRect.x * areaRect.scaleFactor),
-      y: Math.round(areaRect.y * areaRect.scaleFactor),
-      width: Math.round(areaRect.width * areaRect.scaleFactor),
-      height: Math.round(areaRect.height * areaRect.scaleFactor),
-    };
-    cropRect.width = cropRect.width - (cropRect.width % 2);
-    cropRect.height = cropRect.height - (cropRect.height % 2);
-    return cropRect;
-  }
-  return null;
-}
-
 async function cleanupRecordingSession() {
   stopSilenceMonitor();
+  await stopAutoStopExtraStreams();
+  audioCapPcmBridgeNeeded = false;
+  await syncAudioCapMonitorLifecycle();
+  teardownAudioCapPcmBridge();
   setPreviewSttPanelLocked(false);
   await stopSttPipeline();
   if (recordingStreamRef) {
@@ -1784,26 +2073,106 @@ async function cleanupRecordingSession() {
   recordedChunks = [];
   sttResult = null;
   userStoppedRecording = false;
-  splitPending = false;
+  recorderStopReason = 'idle';
+  segmentRotateInFlight = false;
 }
 
 /* ── Handle recording data ────────────────────────────────── */
-async function handleRecordingStopped() {
-  stopSilenceMonitor();
-  const cropRect = getCropRectForEncode();
-  const blob = new Blob(recordedChunks, { type: 'video/webm' });
+async function saveCurrentPartWebm(blob, subtitles) {
   const arrayBuffer = await blob.arrayBuffer();
+  if (maxSegmentBytes > 0) {
+    const { filePath } = await window.electronAPI.getAutoPartPath({
+      sessionId: recordingSessionId,
+      partIndex: segmentPartIndex,
+    });
+    return window.electronAPI.saveRecording({
+      buffer: arrayBuffer,
+      filePath,
+      durationMs: Math.max(0, getRecordingElapsedMs() - segmentStartElapsedMs),
+      subtitles,
+      subtitleFormat: 'srt',
+    });
+  }
+  return window.electronAPI.saveRecording({
+    buffer: arrayBuffer,
+    durationMs: Math.max(0, getRecordingElapsedMs() - segmentStartElapsedMs),
+    subtitles,
+    subtitleFormat: 'srt',
+  });
+}
+
+function startNextSegmentRecorder() {
+  if (!recordingStreamRef) return;
+  mediaRecorder = new MediaRecorder(recordingStreamRef, {
+    mimeType: recordingMimeType || 'video/webm',
+    videoBitsPerSecond: recordingVideoBitrate,
+  });
+  attachMediaRecorderHandlers();
+  recordedChunks = [];
+  segmentByteSize = 0;
+  segmentStartElapsedMs = getRecordingElapsedMs();
+  recorderStopReason = 'idle';
+  segmentRotateInFlight = false;
+  mediaRecorder.start(1000);
+}
+
+async function handleRecordingStopped() {
+  const stopFlowStartedAt = Date.now();
+  const logStopFlow = (label, extra) => {
+    const elapsed = Date.now() - stopFlowStartedAt;
+    if (extra === undefined) {
+      console.log(`[timing][renderer-stop] +${elapsed}ms ${label}`);
+      return;
+    }
+    console.log(`[timing][renderer-stop] +${elapsed}ms ${label}`, extra);
+  };
+  logStopFlow('entered handleRecordingStopped');
+  const blob = new Blob(recordedChunks, { type: 'video/webm' });
+  logStopFlow('created WebM blob', { bytes: blob.size });
+  logStopFlow('prepared raw WebM for metadata rebuild', {
+    bytes: blob.size,
+    recorderStopReason,
+  });
+
+  if (recorderStopReason === 'rotate') {
+    if (blob.size > 0) {
+      const saveAt = Date.now();
+      await saveCurrentPartWebm(blob, []);
+      logStopFlow('saveRecording complete (rotated part)', {
+        durationMs: Date.now() - saveAt,
+      });
+      segmentPartIndex += 1;
+    }
+    startNextSegmentRecorder();
+    if (toggleAutoStopSilence.checked) {
+      // Keep auto-stop running across segment rotation.
+      // Do not recreate streams; continue monitoring current recording stream.
+      startSilenceMonitor({
+        recordStream:
+          autoStopSelectedSource === 'system' ? recordingStreamRef : null,
+        sttMicStream:
+          autoStopSelectedSource === 'mic' ? sttDedicatedMicStream : null,
+        systemViaAudioCap: autoStopSelectedSource === 'system',
+      });
+    }
+    status.textContent = recordingStatusMessage();
+    return;
+  }
+
+  stopSilenceMonitor();
 
   if (userStoppedRecording) {
-    if (arrayBuffer.byteLength === 0) {
+    if (blob.size === 0) {
       status.textContent = 'Nothing recorded';
       await cleanupRecordingSession();
       return;
     }
 
-    status.textContent = 'Converting to MP4...';
+    status.textContent = 'Saving WebM...';
 
+    const stopSttAt = Date.now();
     await stopSttPipeline();
+    logStopFlow('stopSttPipeline complete', { durationMs: Date.now() - stopSttAt });
 
     const segmentsRaw = sttResult?.segments || [];
     const recordingDurationMs = Math.max(0, getRecordingElapsedMs());
@@ -1814,32 +2183,18 @@ async function handleRecordingStopped() {
       recordingDurationMs
     );
 
-    let result;
-    if (maxSegmentBytes > 0) {
-      const { filePath } = await window.electronAPI.getAutoPartPath({
-        sessionId: recordingSessionId,
-        partIndex: segmentPartIndex,
-      });
-      result = await window.electronAPI.saveRecording({
-        buffer: arrayBuffer,
-        cropRect,
-        filePath,
-        subtitles: subs,
-        subtitleFormat: 'srt',
-      });
-    } else {
-      result = await window.electronAPI.saveRecording({
-        buffer: arrayBuffer,
-        cropRect,
-        subtitles: subs,
-        subtitleFormat: 'srt',
-      });
-    }
+    const saveAt = Date.now();
+    const result = await saveCurrentPartWebm(blob, subs);
+    logStopFlow('saveRecording complete', {
+      durationMs: Date.now() - saveAt,
+      success: Boolean(result?.success),
+      reason: result?.reason || '',
+    });
 
     if (result.success) {
       const videoName = result.filePath.split('/').pop();
-      if (result.burnedPath) {
-        status.textContent = `Saved: ${videoName} + subtitles + burned`;
+      if (maxSegmentBytes > 0) {
+        status.textContent = `Saved: part ${segmentPartIndex} (${videoName})`;
       } else if (result.subtitlePath) {
         status.textContent = `Saved: ${videoName} + subtitles`;
       } else {
@@ -1883,53 +2238,14 @@ async function handleRecordingStopped() {
     recordedChunks = [];
     sttResult = null;
     userStoppedRecording = false;
+    await stopAutoStopExtraStreams();
+    audioCapPcmBridgeNeeded = false;
+    await syncAudioCapMonitorLifecycle();
+    teardownAudioCapPcmBridge();
+    logStopFlow('flow complete (user stop)');
     return;
   }
 
-  if (splitPending) {
-    splitPending = false;
-    if (arrayBuffer.byteLength === 0) {
-      status.textContent = 'Split error: empty segment';
-      await cleanupRecordingSession();
-      return;
-    }
-
-    btnStop.disabled = true;
-    if (btnPause) btnPause.disabled = true;
-    const { filePath } = await window.electronAPI.getAutoPartPath({
-      sessionId: recordingSessionId,
-      partIndex: segmentPartIndex,
-    });
-    status.textContent = `Saving part ${segmentPartIndex}...`;
-    const result = await window.electronAPI.saveRecording({
-      buffer: arrayBuffer,
-      cropRect,
-      filePath,
-      subtitles: [],
-      subtitleFormat: 'srt',
-    });
-    btnStop.disabled = false;
-    if (btnPause) btnPause.disabled = false;
-
-    if (!result.success) {
-      status.textContent = `Error: ${result.reason}`;
-      await cleanupRecordingSession();
-      return;
-    }
-
-    segmentPartIndex += 1;
-    recordedChunks = [];
-    segmentByteSize = 0;
-    status.textContent = recordingStatusMessage();
-
-    mediaRecorder = new MediaRecorder(recordingStreamRef, {
-      mimeType: recordingMimeType,
-      videoBitsPerSecond: recordingVideoBitrate,
-    });
-    attachMediaRecorderHandlers();
-    mediaRecorder.start(1000);
-    return;
-  }
 }
 
 /* ── Timer (excludes paused time) ─────────────────────────── */
@@ -1984,6 +2300,31 @@ function stopTimer() {
   timerSegmentStart = null;
 }
 
+function formatDurationMs(ms) {
+  const totalSec = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+function stopSaveConversionElapsedTicker() {
+  if (saveConversionElapsedTimer) {
+    clearInterval(saveConversionElapsedTimer);
+    saveConversionElapsedTimer = null;
+  }
+}
+
+function updateSaveConversionElapsedLabel(prefix = 'Elapsed') {
+  if (!saveModalElapsed) return;
+  if (!saveConversionStartedAtMs) {
+    saveModalElapsed.classList.add('hidden');
+    return;
+  }
+  const elapsed = Date.now() - saveConversionStartedAtMs;
+  saveModalElapsed.textContent = `${prefix}: ${formatDurationMs(elapsed)}`;
+  saveModalElapsed.classList.remove('hidden');
+}
+
 /* ── Keyboard shortcuts ───────────────────────────────────── */
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !settingsModal.classList.contains('hidden')) {
@@ -2009,7 +2350,9 @@ window.electronAPI.onConversionProgress((msg) => {
 });
 
 window.electronAPI.onSttUpdate((payload) => {
-  const text = payload?.combinedText || payload?.text || '';
+  // For live subtitle overlay, prefer the current chunk text so it follows
+  // realtime timeline instead of accumulating the whole transcript.
+  const text = payload?.text || payload?.combinedText || '';
   if (!text.trim()) return;
   lastSttCombinedText = text;
   subtitleOverlay.textContent = text;
@@ -2054,18 +2397,26 @@ subtitleEdit.addEventListener('input', () => {
 window.electronAPI.onSaveProgress((payload) => {
   if (!payload) return;
   if (payload.stage === 'start') {
+    saveConversionStartedAtMs = Date.now();
+    stopSaveConversionElapsedTicker();
     saveModal.classList.remove('hidden');
     saveModalBar.style.width = '0%';
-    saveModalStatus.textContent = payload.message || 'Converting to MP4…';
+    saveModalStatus.textContent = payload.message || 'Saving WebM…';
+    updateSaveConversionElapsedLabel('Elapsed');
+    saveConversionElapsedTimer = setInterval(() => {
+      updateSaveConversionElapsedLabel('Elapsed');
+    }, 500);
     saveModalPath.classList.add('hidden');
     saveModalClose.classList.add('hidden');
   } else if (payload.stage === 'progress') {
-    saveModalStatus.textContent = payload.message || 'Converting…';
+    saveModalStatus.textContent = payload.message || 'Saving…';
     if (payload.percent != null && !Number.isNaN(payload.percent)) {
       saveModalBar.style.width = `${Math.min(100, Math.max(0, payload.percent))}%`;
     }
   } else if (payload.stage === 'done') {
+    stopSaveConversionElapsedTicker();
     saveModalStatus.textContent = payload.message || 'Conversion complete';
+    updateSaveConversionElapsedLabel('Total conversion time');
     saveModalBar.style.width = '100%';
     if (payload.filePath) {
       saveModalPath.textContent = payload.filePath;
@@ -2073,7 +2424,9 @@ window.electronAPI.onSaveProgress((payload) => {
     }
     saveModalClose.classList.remove('hidden');
   } else if (payload.stage === 'error') {
+    stopSaveConversionElapsedTicker();
     saveModalStatus.textContent = payload.message || 'Conversion failed';
+    updateSaveConversionElapsedLabel('Conversion time');
     saveModalClose.classList.remove('hidden');
   }
 });
@@ -2117,6 +2470,14 @@ burnModalClose.addEventListener('click', () => {
 window.electronAPI.onSttError((payload) => {
   const reason = payload?.reason || 'Speech-to-Text failed';
   status.textContent = reason;
+});
+
+window.addEventListener('beforeunload', () => {
+  stopAutoStopSourcePreviewMonitor();
+  autoStopAudioCapMonitorSilence = false;
+  audioCapPcmBridgeNeeded = false;
+  teardownAudioCapPcmBridge();
+  void syncAudioCapMonitorLifecycle();
 });
 
 /* ── Initial load ─────────────────────────────────────────── */

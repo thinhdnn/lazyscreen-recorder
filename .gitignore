@@ -8,5 +8,4 @@ out/
 recordings/
 /.shared
 /coverage
-run.sh
 /swift-audiocap/.build

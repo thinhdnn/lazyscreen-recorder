@@ -7,6 +7,7 @@ const mockDesktopGetSources = jest.fn(async () => []);
 const mockShowOpenDialog = jest.fn(async () => ({ canceled: true, filePaths: [] }));
 const mockShowSaveDialog = jest.fn(async () => ({ canceled: true }));
 const mockFixWebmMetaInfo = jest.fn(async (blob) => blob);
+const mockSpawn = jest.fn();
 
 jest.mock('electron', () => ({
   app: {
@@ -47,11 +48,19 @@ jest.mock('electron', () => ({
   },
 }));
 
+jest.mock('child_process', () => {
+  const EventEmitter = require('events');
+  return {
+    execSync: jest.fn(() => ''),
+    spawn: (...args) => mockSpawn(...args),
+  };
+});
+
 jest.mock('../src/main/soniox', () => ({
   SonioxClient: jest.fn(),
 }));
 jest.mock('../src/main/subtitles', () => ({
-  buildSrt: jest.fn(() => ''),
+  buildSrt: jest.fn(() => '1\n00:00:00,000 --> 00:00:01,000\nHello\n'),
   buildVtt: jest.fn(() => ''),
 }));
 jest.mock('../src/main/settings-utils', () => ({}));
@@ -109,6 +118,17 @@ describe('main/index helper logic', () => {
     mockShowSaveDialog.mockResolvedValue({ canceled: true });
     mockFixWebmMetaInfo.mockReset();
     mockFixWebmMetaInfo.mockImplementation(async (blob) => blob);
+    mockSpawn.mockReset();
+    mockSpawn.mockImplementation(() => {
+      const EventEmitter = require('events');
+      const child = new EventEmitter();
+      child.stderr = new EventEmitter();
+      process.nextTick(() => {
+        child.stderr.emit('data', Buffer.from('time=00:00:01.00'));
+        child.emit('close', 0);
+      });
+      return child;
+    });
   });
 
   test('windowBackgroundForTheme returns expected colors', () => {
@@ -182,6 +202,59 @@ describe('main/index helper logic', () => {
     expect(result.sttSourceLanguage).toBe('vi');
     expect(result.sttContextDomain).toBe('my-domain');
     expect(result.sttTranslationTargetLanguage).toBe('en');
+  });
+
+  test('normalizeSelectedArea offsets overlay-local rect by display bounds', () => {
+    const { normalizeSelectedArea } = getTestHelpers();
+    expect(
+      normalizeSelectedArea(
+        { x: 20, y: 30, width: 300, height: 200 },
+        {
+          id: 42,
+          scaleFactor: 2,
+          bounds: { x: -1440, y: 120, width: 1440, height: 900 },
+        }
+      )
+    ).toEqual({
+      x: -1420,
+      y: 150,
+      width: 300,
+      height: 200,
+      scaleFactor: 2,
+      displayId: 42,
+      displayBounds: { x: -1440, y: 120, width: 1440, height: 900 },
+    });
+  });
+
+  test('mergeSubtitleSegmentsForBurn groups nearby speech into one held subtitle', () => {
+    const { mergeSubtitleSegmentsForBurn } = getTestHelpers();
+    expect(
+      mergeSubtitleSegmentsForBurn([
+        { startMs: 1000, endMs: 1500, text: 'We can set' },
+        { startMs: 2300, endMs: 2800, text: 'the value has changed.' },
+        { startMs: 7000, endMs: 7600, text: 'Next sentence.' },
+      ])
+    ).toEqual([
+      {
+        startMs: 1000,
+        endMs: 4800,
+        text: 'We can set the value has changed.',
+      },
+      {
+        startMs: 7000,
+        endMs: 9600,
+        text: 'Next sentence.',
+      },
+    ]);
+  });
+
+  test('mergeSubtitleSegmentsForBurn adds a period when speech text has no punctuation', () => {
+    const { mergeSubtitleSegmentsForBurn } = getTestHelpers();
+    expect(
+      mergeSubtitleSegmentsForBurn([
+        { startMs: 0, endMs: 1000, text: 'hello world' },
+      ])
+    ).toEqual([{ startMs: 0, endMs: 3000, text: 'hello world.' }]);
   });
 
   test('request-microphone-permission returns granted without prompting', async () => {
@@ -268,9 +341,83 @@ describe('main/index helper logic', () => {
       success: true,
       filePath: '/tmp/recording.webm',
       subtitlePath: null,
+      burnedSubtitles: false,
     });
 
     writeSpy.mockRestore();
     mkdirSpy.mockRestore();
+  });
+
+  test('save-recording burns speech subtitles into MP4 when requested', async () => {
+    loadIndex();
+    const handlers = getHandleMap();
+    mockShowSaveDialog.mockResolvedValueOnce({
+      canceled: false,
+      filePath: '/tmp/recording.mp4',
+    });
+    const fs = require('fs');
+    const writeSpy = jest.spyOn(fs, 'writeFileSync').mockImplementation(() => {});
+    const mkdirSpy = jest.spyOn(fs, 'mkdirSync').mockImplementation(() => {});
+    const mkdtempSpy = jest
+      .spyOn(fs, 'mkdtempSync')
+      .mockImplementation(() => '/tmp/lazyscreen-burn-test');
+    const rmSpy = jest.spyOn(fs, 'rmSync').mockImplementation(() => {});
+
+    const result = await handlers['save-recording'](null, {
+      buffer: new Uint8Array([1, 2, 3, 4]).buffer,
+      durationMs: 1000,
+      subtitles: [
+        { index: 0, text: 'Hello', startMs: 0, endMs: 400 },
+        { index: 1, text: 'world', startMs: 1000, endMs: 1400 },
+      ],
+      subtitleFormat: 'srt',
+      burnSubtitlesIntoVideo: true,
+    });
+
+    expect(mockSpawn).toHaveBeenCalledWith(
+      expect.stringContaining('ffmpeg'),
+      expect.arrayContaining([
+        '-i',
+        '/tmp/lazyscreen-burn-test/input.webm',
+        '-vf',
+        expect.stringContaining("drawtext="),
+        '/tmp/recording.mp4',
+      ]),
+      { windowsHide: true }
+    );
+    expect(mockSpawn.mock.calls[0][1]).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining("textfile='/tmp/lazyscreen-burn-test/subtitle-0.txt'"),
+      ])
+    );
+    expect(writeSpy).toHaveBeenCalledWith(
+      '/tmp/lazyscreen-burn-test/input.webm',
+      expect.any(Buffer)
+    );
+    expect(writeSpy).toHaveBeenCalledWith(
+      '/tmp/lazyscreen-burn-test/subtitle-0.txt',
+      'Hello world.',
+      'utf-8'
+    );
+    expect(writeSpy).toHaveBeenCalledWith(
+      '/tmp/lazyscreen-burn-test/subtitles.srt',
+      expect.any(String),
+      'utf-8'
+    );
+    expect(rmSpy).toHaveBeenCalledWith('/tmp/lazyscreen-burn-test', {
+      recursive: true,
+      force: true,
+    });
+    expect(result).toEqual({
+      success: true,
+      filePath: '/tmp/recording.mp4',
+      subtitlePath: null,
+      burnedSubtitles: true,
+    });
+
+    writeSpy.mockRestore();
+    mkdirSpy.mockRestore();
+    mkdtempSpy.mockRestore();
+    rmSpy.mockRestore();
   });
 });

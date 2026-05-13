@@ -81,6 +81,9 @@
       </div>
       <details class="preview-stt-wrap" id="preview-stt-wrap">
         <summary class="preview-stt-summary">Speech-to-text (Soniox) — language &amp; context</summary>
+        <button type="button" class="preview-stt-close" id="btn-preview-stt-close" title="Close speech settings" aria-label="Close speech settings">
+          Close
+        </button>
         <div class="preview-stt-body">
           <p class="preview-stt-hint">Defaults match Settings; change here for this preview session only.</p>
           <label class="preview-stt-label" for="preview-select-stt-source-language">Source language (spoken audio)</label>
@@ -455,9 +458,9 @@
 
       <label class="settings-check-row">
         <input type="checkbox" id="check-burn-subtitles" />
-        <span>Export subtitles as sidecar file (.srt/.vtt)</span>
+        <span>Export subtitle sidecar when subtitles are not burned in</span>
       </label>
-      <p class="settings-hint">Subtitles are exported as sidecar files (.srt/.vtt) next to the WebM video.</p>
+      <p class="settings-hint">Speech recordings with subtitle segments are automatically saved as MP4 with burned-in subtitles. Requires FFmpeg.</p>
 
       <div class="settings-actions">
         <button id="btn-settings-cancel" class="settings-btn">Cancel</button>

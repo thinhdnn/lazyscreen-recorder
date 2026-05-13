@@ -81,6 +81,34 @@ describe('SonioxClient runtime websocket flow', () => {
     );
   });
 
+  test('uses source text for live display while translation tokens are pending', () => {
+    const onTranscript = jest.fn();
+    const client = new SonioxClient({
+      apiKey: 'k',
+      translationConfig: { type: 'one_way', target_language: 'vi' },
+    });
+    client.startSession({ onTranscript, onError: jest.fn() });
+    const ws = socketInstances[0];
+    ws.__emit('open');
+
+    ws.__emit(
+      'message',
+      JSON.stringify({
+        tokens: [
+          { text: 'Hello', is_final: false, translation_status: 'original' },
+          { text: ' world', is_final: false, translation_status: 'original' },
+        ],
+      })
+    );
+
+    expect(onTranscript).toHaveBeenCalledWith(
+      expect.objectContaining({
+        isFinal: false,
+        text: 'Hello world',
+      })
+    );
+  });
+
   test('reports websocket and payload errors', () => {
     const onError = jest.fn();
     const client = new SonioxClient({ apiKey: 'k' });

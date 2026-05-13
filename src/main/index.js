@@ -17,7 +17,7 @@ const { buildSrt, buildVtt } = require('./subtitles');
 const settingsUtils = require('./settings-utils');
 
 let mainWindow = null;
-let areaOverlayWindow = null;
+let areaOverlayWindows = [];
 let sttSession = null;
 let audioCapMonitorProcess = null;
 let audioCapPcmRemainder = Buffer.alloc(0);
@@ -46,6 +46,212 @@ let appSettings = {
   autoStopAudioSource: 'system',
   autoStopMicDeviceId: '',
 };
+
+function findFfmpegPath() {
+  let ffmpegStaticPath = null;
+  try {
+    ffmpegStaticPath = require('ffmpeg-static');
+  } catch (_) {}
+
+  const candidates = [
+    process.env.FFMPEG_PATH,
+    ffmpegStaticPath,
+    process.platform === 'win32'
+      ? path.join(process.resourcesPath || '', 'ffmpeg', 'ffmpeg.exe')
+      : path.join(process.resourcesPath || '', 'ffmpeg', 'ffmpeg'),
+    process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg',
+  ].filter(Boolean);
+
+  for (const candidate of candidates) {
+    if (candidate.includes(path.sep) && fs.existsSync(candidate)) {
+      return candidate;
+    }
+    if (!candidate.includes(path.sep)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function ffmpegFilterPath(filePath) {
+  return filePath
+    .replace(/\\/g, '/')
+    .replace(/:/g, '\\:')
+    .replace(/'/g, "\\'");
+}
+
+function getDrawtextFontArg() {
+  const candidates = [
+    process.env.LAZYSCREEN_SUBTITLE_FONT,
+    '/System/Library/Fonts/Supplemental/Arial Unicode.ttf',
+    '/System/Library/Fonts/Supplemental/Arial.ttf',
+    '/Library/Fonts/Arial Unicode.ttf',
+    'C:\\Windows\\Fonts\\arial.ttf',
+    '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+  ].filter(Boolean);
+  const fontPath = candidates.find((candidate) => {
+    try {
+      return fs.existsSync(candidate);
+    } catch (_) {
+      return false;
+    }
+  });
+  return fontPath ? `fontfile='${ffmpegFilterPath(fontPath)}':` : '';
+}
+
+function wrapSubtitleText(text) {
+  const words = String(text || '').trim().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return '';
+  const maxChars = 48;
+  const lines = [];
+  for (const word of words) {
+    const current = lines[lines.length - 1] || '';
+    if (!current) {
+      lines.push(word);
+    } else if (`${current} ${word}`.length <= maxChars || lines.length >= 2) {
+      lines[lines.length - 1] = `${current} ${word}`;
+    } else {
+      lines.push(word);
+    }
+  }
+  return lines.slice(0, 2).join('\n');
+}
+
+function normalizeBurnSubtitleText(text) {
+  const normalized = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!normalized) return '';
+  return /[.!?…]$/.test(normalized) ? normalized : `${normalized}.`;
+}
+
+function mergeSubtitleSegmentsForBurn(subtitles, holdMs = 2000) {
+  if (!Array.isArray(subtitles) || subtitles.length === 0) return [];
+  const sorted = subtitles
+    .map((subtitle) => ({
+      startMs: Math.max(0, Number(subtitle.startMs) || 0),
+      endMs: Math.max(0, Number(subtitle.endMs) || 0),
+      text: String(subtitle.text || '').trim(),
+    }))
+    .filter((subtitle) => subtitle.text)
+    .sort((a, b) => a.startMs - b.startMs);
+
+  const merged = [];
+  for (const subtitle of sorted) {
+    const startMs = subtitle.startMs;
+    const endMs = Math.max(subtitle.endMs, startMs + 500);
+    const last = merged[merged.length - 1];
+    if (last && startMs <= last.lastTextEndMs + holdMs) {
+      last.text = `${last.text} ${subtitle.text}`.replace(/\s+/g, ' ').trim();
+      last.lastTextEndMs = Math.max(last.lastTextEndMs, endMs);
+      last.endMs = last.lastTextEndMs + holdMs;
+      continue;
+    }
+    merged.push({
+      startMs,
+      endMs: endMs + holdMs,
+      lastTextEndMs: endMs,
+      text: subtitle.text,
+    });
+  }
+
+  for (let i = 0; i < merged.length - 1; i += 1) {
+    merged[i].endMs = Math.min(merged[i].endMs, merged[i + 1].startMs);
+  }
+
+  return merged.map(({ lastTextEndMs, ...subtitle }) => ({
+    ...subtitle,
+    text: normalizeBurnSubtitleText(subtitle.text),
+  }));
+}
+
+function buildDrawtextSubtitleFilter(subtitleTextFiles) {
+  const fontArg = getDrawtextFontArg();
+  return subtitleTextFiles
+    .map(({ filePath, startMs, endMs }) => {
+      const start = Math.max(0, Number(startMs) || 0) / 1000;
+      const rawEnd = Math.max(0, Number(endMs) || 0) / 1000;
+      const end = rawEnd > start ? rawEnd : start + 2;
+      return [
+        `drawtext=${fontArg}textfile='${ffmpegFilterPath(filePath)}'`,
+        'fontcolor=white',
+        'fontsize=h/30',
+        'line_spacing=8',
+        'box=1',
+        'boxcolor=black@0.45',
+        'boxborderw=12',
+        'borderw=3',
+        'bordercolor=black',
+        'x=(w-text_w)/2',
+        'y=h-text_h-h/12',
+        `enable='between(t,${start.toFixed(3)},${end.toFixed(3)})'`,
+      ].join(':');
+    })
+    .join(',');
+}
+
+function parseFfmpegTimeMs(line) {
+  const m = /time=(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(String(line));
+  if (!m) return null;
+  const hours = Number(m[1]) || 0;
+  const mins = Number(m[2]) || 0;
+  const secs = Number(m[3]) || 0;
+  return Math.max(0, Math.round(((hours * 60 + mins) * 60 + secs) * 1000));
+}
+
+function runFfmpegBurnSubtitles({
+  inputPath,
+  subtitleTextFiles,
+  outputPath,
+  durationMs,
+  onProgress,
+}) {
+  const ffmpegPath = findFfmpegPath();
+  if (!ffmpegPath) {
+    throw new Error('FFmpeg not found. Set FFMPEG_PATH or bundle ffmpeg with the app.');
+  }
+  console.log('[ffmpeg] using binary:', ffmpegPath);
+
+  const videoCodec =
+    process.platform === 'darwin' ? 'h264_videotoolbox' : 'libx264';
+  const args = [
+    '-y',
+    '-i',
+    inputPath,
+    '-vf',
+    buildDrawtextSubtitleFilter(subtitleTextFiles),
+    '-c:v',
+    videoCodec,
+    ...(videoCodec === 'libx264' ? ['-preset', 'veryfast'] : ['-b:v', '6M']),
+    '-c:a',
+    'aac',
+    '-movflags',
+    '+faststart',
+    outputPath,
+  ];
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(ffmpegPath, args, { windowsHide: true });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => {
+      const text = chunk.toString();
+      stderr += text;
+      const timeMs = parseFfmpegTimeMs(text);
+      if (timeMs != null && durationMs > 0) {
+        onProgress?.(Math.min(99, Math.round((timeMs / durationMs) * 100)));
+      }
+    });
+    child.on('error', (err) => {
+      reject(err);
+    });
+    child.on('close', (code) => {
+      if (code === 0) {
+        resolve();
+        return;
+      }
+      const tail = stderr.trim().split('\n').slice(-6).join('\n');
+      reject(new Error(tail || `FFmpeg exited with code ${code}`));
+    });
+  });
+}
 
 async function probeWebmMetadata(blob) {
   try {
@@ -483,51 +689,82 @@ ipcMain.handle('get-sources', async (_event, type) => {
 
 // ── IPC: Area selection overlay ─────────────────────────────────────────────
 
+function closeAreaOverlayWindows() {
+  for (const win of areaOverlayWindows) {
+    try {
+      if (!win.isDestroyed?.()) win.close();
+    } catch (_) {}
+  }
+  areaOverlayWindows = [];
+}
+
+function getSelectionDisplayForWindow(win) {
+  if (!win) return screen.getPrimaryDisplay();
+  const bounds = win.getBounds();
+  return (
+    screen.getAllDisplays().find((display) => {
+      const b = display.bounds;
+      return b.x === bounds.x && b.y === bounds.y;
+    }) || screen.getDisplayMatching(bounds)
+  );
+}
+
+function normalizeSelectedArea(rect, display) {
+  const bounds = display.bounds;
+  return {
+    x: bounds.x + rect.x,
+    y: bounds.y + rect.y,
+    width: rect.width,
+    height: rect.height,
+    scaleFactor: display.scaleFactor,
+    displayId: display.id,
+    displayBounds: bounds,
+  };
+}
+
 ipcMain.handle('start-area-selection', async () => {
   return new Promise((resolve) => {
-    const primaryDisplay = screen.getPrimaryDisplay();
-    const { width, height } = primaryDisplay.size;
-    const scaleFactor = primaryDisplay.scaleFactor;
+    closeAreaOverlayWindows();
 
-    areaOverlayWindow = new BrowserWindow({
-      x: 0,
-      y: 0,
-      width,
-      height,
-      frame: false,
-      transparent: true,
-      alwaysOnTop: true,
-      skipTaskbar: true,
-      resizable: false,
-      movable: false,
-      fullscreenable: false,
-      hasShadow: false,
-      webPreferences: {
-        preload: path.join(__dirname, '..', 'preload.js'),
-        contextIsolation: true,
-        nodeIntegration: false,
-        sandbox: false,
-      },
+    const displays = screen.getAllDisplays();
+    const overlayPath = path.join(__dirname, '..', 'renderer', 'area-overlay.html');
+    areaOverlayWindows = displays.map((display) => {
+      const { x, y, width, height } = display.bounds;
+      const win = new BrowserWindow({
+        x,
+        y,
+        width,
+        height,
+        frame: false,
+        transparent: true,
+        alwaysOnTop: true,
+        skipTaskbar: true,
+        resizable: false,
+        movable: false,
+        fullscreenable: false,
+        hasShadow: false,
+        webPreferences: {
+          preload: path.join(__dirname, '..', 'preload.js'),
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: false,
+        },
+      });
+
+      win.setVisibleOnAllWorkspaces(true);
+      win.loadFile(overlayPath);
+      return win;
     });
 
-    areaOverlayWindow.setVisibleOnAllWorkspaces(true);
-    areaOverlayWindow.loadFile(
-      path.join(__dirname, '..', 'renderer', 'area-overlay.html')
-    );
-
-    ipcMain.once('area-selected', (_event, rect) => {
-      if (areaOverlayWindow) {
-        areaOverlayWindow.close();
-        areaOverlayWindow = null;
-      }
-      resolve({ ...rect, scaleFactor });
+    ipcMain.once('area-selected', (event, rect) => {
+      const overlayWindow = BrowserWindow.fromWebContents(event.sender);
+      const display = getSelectionDisplayForWindow(overlayWindow);
+      closeAreaOverlayWindows();
+      resolve(normalizeSelectedArea(rect, display));
     });
 
     ipcMain.once('area-cancelled', () => {
-      if (areaOverlayWindow) {
-        areaOverlayWindow.close();
-        areaOverlayWindow = null;
-      }
+      closeAreaOverlayWindows();
       resolve(null);
     });
   });
@@ -553,12 +790,16 @@ ipcMain.handle(
     subtitleFormat,
     filePath: explicitPath,
     durationMs,
+    burnSubtitlesIntoVideo,
   } = payload;
   const silentAutoSave = Boolean(explicitPath);
+  const hasSubtitles = Array.isArray(subtitles) && subtitles.length > 0;
+  const shouldBurnSubtitles = Boolean(burnSubtitlesIntoVideo && hasSubtitles);
   logSaveFlow('entered save-recording handler', {
     bufferBytes: buffer?.byteLength || 0,
-    subtitleCount: Array.isArray(subtitles) ? subtitles.length : 0,
+    subtitleCount: hasSubtitles ? subtitles.length : 0,
     durationMs: Number(durationMs) || 0,
+    shouldBurnSubtitles,
   });
 
   const desktopPath = app.getPath('desktop');
@@ -572,12 +813,22 @@ ipcMain.handle(
   if (!filePath) {
     const { filePath: chosen, canceled } = await dialog.showSaveDialog(mainWindow, {
       title: 'Save Recording',
-      defaultPath: path.join(defaultFolder, `recording-${Date.now()}.webm`),
-      filters: [{ name: 'WebM Video', extensions: ['webm'] }],
+      defaultPath: path.join(
+        defaultFolder,
+        `recording-${Date.now()}.${shouldBurnSubtitles ? 'mp4' : 'webm'}`
+      ),
+      filters: [
+        shouldBurnSubtitles
+          ? { name: 'MP4 Video', extensions: ['mp4'] }
+          : { name: 'WebM Video', extensions: ['webm'] },
+      ],
     });
 
     if (canceled || !chosen) return { success: false, reason: 'cancelled' };
     filePath = chosen;
+  }
+  if (shouldBurnSubtitles) {
+    filePath = filePath.replace(/\.[^.\\/]+$/i, '.mp4');
   }
   logSaveFlow('resolved output path', { filePath });
 
@@ -585,6 +836,7 @@ ipcMain.handle(
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
   } catch (_) {}
 
+  let burnTmpDir = null;
   try {
     if (!silentAutoSave) {
       mainWindow?.webContents.send('save-progress', {
@@ -610,19 +862,78 @@ ipcMain.handle(
       metadataDurationMs: metadataProbe.durationMs,
       cuesCount: metadataProbe.cuesCount,
     });
-    fs.writeFileSync(filePath, fixedBuffer);
-    logSaveFlow('wrote WebM output', { filePath });
-    if (!silentAutoSave) {
-      mainWindow?.webContents.send('save-progress', {
-        stage: 'done',
-        message: 'WebM saved',
-        filePath,
-        percent: 100,
-      });
-    }
     let subtitlePath = null;
 
-    if (Array.isArray(subtitles) && subtitles.length > 0) {
+    if (shouldBurnSubtitles) {
+      burnTmpDir = fs.mkdtempSync(path.join(app.getPath('temp'), 'lazyscreen-burn-'));
+      const tmpWebmPath = path.join(burnTmpDir, 'input.webm');
+      const tmpSubtitlePath = path.join(burnTmpDir, 'subtitles.srt');
+      const burnSubtitles = mergeSubtitleSegmentsForBurn(subtitles);
+      const subtitleTextFiles = burnSubtitles.map((subtitle, index) => {
+        const filePath = path.join(burnTmpDir, `subtitle-${index}.txt`);
+        fs.writeFileSync(filePath, wrapSubtitleText(subtitle.text), 'utf-8');
+        return {
+          filePath,
+          startMs: subtitle.startMs,
+          endMs: subtitle.endMs,
+        };
+      });
+      fs.writeFileSync(tmpWebmPath, fixedBuffer);
+      fs.writeFileSync(tmpSubtitlePath, buildSrt(burnSubtitles), 'utf-8');
+      logSaveFlow('wrote temporary burn inputs', {
+        tmpDir: burnTmpDir,
+        sourceSubtitleCount: subtitles.length,
+        burnSubtitleCount: burnSubtitles.length,
+      });
+      if (!silentAutoSave) {
+        mainWindow?.webContents.send('burn-progress', {
+          stage: 'start',
+          message: 'Burning subtitles to MP4…',
+          percent: 0,
+        });
+      }
+      await runFfmpegBurnSubtitles({
+        inputPath: tmpWebmPath,
+        subtitleTextFiles,
+        outputPath: filePath,
+        durationMs: Number(durationMs) || metadataProbe.durationMs || 0,
+        onProgress: (percent) => {
+          if (!silentAutoSave) {
+            mainWindow?.webContents.send('burn-progress', {
+              stage: 'progress',
+              message: `Burning subtitles… ${percent}%`,
+              percent,
+            });
+          }
+        },
+      });
+      try {
+        fs.rmSync(burnTmpDir, { recursive: true, force: true });
+        burnTmpDir = null;
+      } catch (_) {}
+      logSaveFlow('burned MP4 subtitles', { filePath });
+      if (!silentAutoSave) {
+        mainWindow?.webContents.send('burn-progress', {
+          stage: 'done',
+          message: 'MP4 saved with subtitles',
+          filePath,
+          percent: 100,
+        });
+      }
+    } else {
+      fs.writeFileSync(filePath, fixedBuffer);
+      logSaveFlow('wrote WebM output', { filePath });
+      if (!silentAutoSave) {
+        mainWindow?.webContents.send('save-progress', {
+          stage: 'done',
+          message: 'WebM saved',
+          filePath,
+          percent: 100,
+        });
+      }
+    }
+
+    if (!shouldBurnSubtitles && hasSubtitles) {
       const ext = subtitleFormat === 'vtt' ? 'vtt' : 'srt';
       const subtitleContent =
         ext === 'vtt' ? buildVtt(subtitles) : buildSrt(subtitles);
@@ -636,8 +947,18 @@ ipcMain.handle(
       filePath,
       subtitlePath,
     });
-    return { success: true, filePath, subtitlePath };
+    return {
+      success: true,
+      filePath,
+      subtitlePath,
+      burnedSubtitles: shouldBurnSubtitles,
+    };
   } catch (err) {
+    if (burnTmpDir) {
+      try {
+        fs.rmSync(burnTmpDir, { recursive: true, force: true });
+      } catch (_) {}
+    }
     logSaveFlow('save-recording failed', {
       totalDurationMs: Date.now() - saveFlowStartedAt,
       reason: err.message || String(err),
@@ -647,6 +968,12 @@ ipcMain.handle(
         stage: 'error',
         message: err.message || String(err),
       });
+      if (shouldBurnSubtitles) {
+        mainWindow?.webContents.send('burn-progress', {
+          stage: 'error',
+          message: err.message || String(err),
+        });
+      }
     }
     return { success: false, reason: err.message };
   }
@@ -985,6 +1312,7 @@ ipcMain.handle('stt-start', (_event, options = {}) => {
       mainWindow?.webContents.send('stt-update', payload);
     },
     onError: (reason) => {
+      console.error('[soniox][stt-error]', reason);
       mainWindow?.webContents.send('stt-error', { reason });
     },
   });
@@ -1041,5 +1369,7 @@ module.exports = {
     buildSttContextPayloadFromState,
     buildTranslationConfigFromState,
     resolveSttStateForSession,
+    normalizeSelectedArea,
+    mergeSubtitleSegmentsForBurn,
   },
 };

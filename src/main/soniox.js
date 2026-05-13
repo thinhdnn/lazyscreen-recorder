@@ -48,6 +48,12 @@ function extractTranscriptText(msg, preferTranslation) {
   return '';
 }
 
+function extractDisplayTranscriptText(msg, preferTranslation) {
+  const preferred = extractTranscriptText(msg, preferTranslation);
+  if (preferred || !preferTranslation) return preferred;
+  return extractTranscriptText(msg, false);
+}
+
 class SonioxClient {
   /**
    * @param {object} opts
@@ -154,7 +160,7 @@ class SonioxClient {
           return;
         }
         if (msg.finished) {
-          const text = extractTranscriptText(msg, this.preferTranslation);
+          const text = extractDisplayTranscriptText(msg, this.preferTranslation);
           this.onTranscript?.({
             text,
             isFinal: true,
@@ -164,7 +170,8 @@ class SonioxClient {
           return;
         }
         const tokens = msg.tokens;
-        const text = extractTranscriptText(msg, this.preferTranslation);
+        const preferredText = extractTranscriptText(msg, this.preferTranslation);
+        const text = preferredText || extractDisplayTranscriptText(msg, this.preferTranslation);
         if (!text && (!Array.isArray(tokens) || tokens.length === 0)) return;
 
         const allTokensFinal =
@@ -174,7 +181,7 @@ class SonioxClient {
 
         if (allTokensFinal) {
           const shouldStoreSegment =
-            !this.preferTranslation || Boolean(text && text.trim());
+            !this.preferTranslation || Boolean(preferredText && preferredText.trim());
           if (shouldStoreSegment) {
             const idx = this.segmentCounter;
             this.segmentCounter += 1;
@@ -185,7 +192,7 @@ class SonioxClient {
               : 0;
             this.finalSegments.push({
               index: idx,
-              text,
+              text: this.preferTranslation ? preferredText : text,
               startMs,
               endMs,
             });

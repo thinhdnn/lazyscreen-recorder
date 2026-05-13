@@ -58,6 +58,8 @@ const SUBTITLE_SAMPLE_TEXT =
   'Preview subtitle — adjust position and size';
 
 let recordingStreamRef = null;
+let recordingCropCleanup = null;
+let previewCropCleanup = null;
 let recordingSessionId = 0;
 let segmentPartIndex = 1;
 let segmentByteSize = 0;
@@ -77,6 +79,101 @@ function videoBitrateForRecordingQuality(q) {
   if (q === 'balance') return 3_000_000;
   if (q === 'high') return 8_000_000;
   return 5_000_000;
+}
+
+function stopRecordingCrop() {
+  if (recordingCropCleanup) {
+    recordingCropCleanup();
+    recordingCropCleanup = null;
+  }
+}
+
+function stopPreviewCrop() {
+  if (previewCropCleanup) {
+    previewCropCleanup();
+    previewCropCleanup = null;
+  }
+}
+
+async function cropStreamToSelectedArea(stream, rect) {
+  if (!rect || currentMode !== 'area') {
+    return { stream, cleanup: () => {} };
+  }
+
+  const sourceVideoTrack = stream.getVideoTracks()[0];
+  if (!sourceVideoTrack) {
+    return { stream, cleanup: () => {} };
+  }
+
+  const video = document.createElement('video');
+  video.muted = true;
+  video.playsInline = true;
+  video.srcObject = new MediaStream([sourceVideoTrack]);
+  await video.play();
+  if (!video.videoWidth || !video.videoHeight) {
+    await new Promise((resolve) => {
+      video.addEventListener('loadedmetadata', resolve, { once: true });
+    });
+  }
+
+  const displayBounds = rect.displayBounds || {
+    x: 0,
+    y: 0,
+    width: video.videoWidth / (rect.scaleFactor || 1),
+    height: video.videoHeight / (rect.scaleFactor || 1),
+  };
+  const scaleX = video.videoWidth / displayBounds.width;
+  const scaleY = video.videoHeight / displayBounds.height;
+  const sourceX = Math.round((rect.x - displayBounds.x) * scaleX);
+  const sourceY = Math.round((rect.y - displayBounds.y) * scaleY);
+  const sourceWidth = Math.round(rect.width * scaleX);
+  const sourceHeight = Math.round(rect.height * scaleY);
+  const cropX = Math.max(0, Math.min(video.videoWidth - 1, sourceX));
+  const cropY = Math.max(0, Math.min(video.videoHeight - 1, sourceY));
+  const cropWidth = Math.max(1, Math.min(video.videoWidth - cropX, sourceWidth));
+  const cropHeight = Math.max(1, Math.min(video.videoHeight - cropY, sourceHeight));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = cropWidth;
+  canvas.height = cropHeight;
+  const ctx = canvas.getContext('2d');
+  let stopped = false;
+  let rafId = 0;
+
+  const draw = () => {
+    if (stopped) return;
+    ctx.drawImage(
+      video,
+      cropX,
+      cropY,
+      cropWidth,
+      cropHeight,
+      0,
+      0,
+      cropWidth,
+      cropHeight
+    );
+    rafId = requestAnimationFrame(draw);
+  };
+  draw();
+
+  const canvasStream = canvas.captureStream(60);
+  const croppedVideoTrack = canvasStream.getVideoTracks()[0];
+  const croppedStream = new MediaStream([
+    croppedVideoTrack,
+    ...stream.getAudioTracks(),
+  ]);
+
+  return {
+    stream: croppedStream,
+    cleanup: () => {
+      stopped = true;
+      if (rafId) cancelAnimationFrame(rafId);
+      video.pause();
+      video.srcObject = null;
+      sourceVideoTrack.stop();
+    },
+  };
 }
 
 const {
@@ -160,6 +257,7 @@ const btnSubtitleFontMinus = $('#btn-subtitle-font-minus');
 const btnSubtitleFontPlus = $('#btn-subtitle-font-plus');
 const spanSubtitleFontPx = $('#span-subtitle-font-px');
 const previewSttWrap = $('#preview-stt-wrap');
+const btnPreviewSttClose = $('#btn-preview-stt-close');
 const previewSelectSttSourceLanguage = $('#preview-select-stt-source-language');
 const previewCheckSttLangStrict = $('#preview-check-stt-lang-strict');
 const previewSelectSttTranslationTargetLanguage = $(
@@ -325,6 +423,12 @@ subtitlePreviewToolbar.addEventListener('mousedown', (e) => {
 
 previewSttWrap?.addEventListener('mousedown', (e) => {
   e.stopPropagation();
+});
+
+btnPreviewSttClose?.addEventListener('click', (e) => {
+  e.preventDefault();
+  previewSttWrap.open = false;
+  previewSttWrap.querySelector('.preview-stt-summary')?.focus();
 });
 
 rangeSubtitleFontSize.addEventListener('input', () => {
@@ -1158,6 +1262,7 @@ async function showPreview() {
       previewStream.getTracks().forEach((track) => track.stop());
       previewStream = null;
     }
+    stopPreviewCrop();
 
     const videoConstraints = {
       mandatory: {
@@ -1166,10 +1271,13 @@ async function showPreview() {
       },
     };
 
-    previewStream = await navigator.mediaDevices.getUserMedia({
+    const sourcePreviewStream = await navigator.mediaDevices.getUserMedia({
       audio: false,
       video: videoConstraints,
     });
+    const croppedPreview = await cropStreamToSelectedArea(sourcePreviewStream, areaRect);
+    previewStream = croppedPreview.stream;
+    previewCropCleanup = croppedPreview.cleanup;
 
     previewVideo.srcObject = previewStream;
     sourcePicker.classList.add('hidden');
@@ -1183,6 +1291,7 @@ async function showPreview() {
 }
 
 function clearPreviewStream() {
+  stopPreviewCrop();
   if (previewStream) {
     previewStream.getTracks().forEach((track) => track.stop());
     previewStream = null;
@@ -1529,11 +1638,12 @@ async function selectArea() {
     updateRecordButton();
 
     try {
-      if (!selectedSource) {
-        const sources = await window.electronAPI.getSources('screen');
-        if (sources.length > 0) {
-          selectedSource = sources[0];
-        }
+      const sources = await window.electronAPI.getSources('screen');
+      if (sources.length > 0) {
+        const displayId = String(result.displayId || '');
+        selectedSource =
+          sources.find((source) => String(source.display_id) === displayId) ||
+          sources[0];
       }
       if (selectedSource) {
         await showPreview();
@@ -1732,7 +1842,10 @@ async function startRecording() {
     if (currentMode === 'area') {
       const sources = await window.electronAPI.getSources('screen');
       if (sources.length === 0) throw new Error('No screen source found');
-      selectedSource = sources[0];
+      const displayId = String(areaRect?.displayId || '');
+      selectedSource =
+        sources.find((source) => String(source.display_id) === displayId) ||
+        sources[0];
     }
 
     const videoConstraints = {
@@ -1823,6 +1936,11 @@ async function startRecording() {
       const sysTrack = nativeSystemAudioStream.getAudioTracks()[0];
       finalStream = new MediaStream([videoTrack, sysTrack]);
     }
+
+    stopRecordingCrop();
+    const croppedRecording = await cropStreamToSelectedArea(finalStream, areaRect);
+    finalStream = croppedRecording.stream;
+    recordingCropCleanup = croppedRecording.cleanup;
 
     recordedChunks = [];
 
@@ -1952,6 +2070,7 @@ async function startRecording() {
     audioCapPcmBridgeNeeded = false;
     await syncAudioCapMonitorLifecycle();
     teardownAudioCapPcmBridge();
+    stopRecordingCrop();
     if (sttDedicatedMicStream) {
       sttDedicatedMicStream.getTracks().forEach((t) => t.stop());
       sttDedicatedMicStream = null;
@@ -2053,6 +2172,7 @@ async function cleanupRecordingSession() {
   if (recordingStreamRef) {
     recordingStreamRef.getTracks().forEach((track) => track.stop());
   }
+  stopRecordingCrop();
   recordingStreamRef = null;
   clearPreviewStream();
   livePreview.classList.add('hidden');
@@ -2080,6 +2200,11 @@ async function cleanupRecordingSession() {
 /* ── Handle recording data ────────────────────────────────── */
 async function saveCurrentPartWebm(blob, subtitles) {
   const arrayBuffer = await blob.arrayBuffer();
+  const burnSubtitlesIntoVideo = Boolean(
+    toggleStt.checked &&
+      Array.isArray(subtitles) &&
+      subtitles.length > 0
+  );
   if (maxSegmentBytes > 0) {
     const { filePath } = await window.electronAPI.getAutoPartPath({
       sessionId: recordingSessionId,
@@ -2091,6 +2216,7 @@ async function saveCurrentPartWebm(blob, subtitles) {
       durationMs: Math.max(0, getRecordingElapsedMs() - segmentStartElapsedMs),
       subtitles,
       subtitleFormat: 'srt',
+      burnSubtitlesIntoVideo,
     });
   }
   return window.electronAPI.saveRecording({
@@ -2098,6 +2224,7 @@ async function saveCurrentPartWebm(blob, subtitles) {
     durationMs: Math.max(0, getRecordingElapsedMs() - segmentStartElapsedMs),
     subtitles,
     subtitleFormat: 'srt',
+    burnSubtitlesIntoVideo,
   });
 }
 
@@ -2168,7 +2295,9 @@ async function handleRecordingStopped() {
       return;
     }
 
-    status.textContent = 'Saving WebM...';
+    status.textContent = toggleStt.checked
+      ? 'Saving recording...'
+      : 'Saving WebM...';
 
     const stopSttAt = Date.now();
     await stopSttPipeline();
@@ -2195,6 +2324,8 @@ async function handleRecordingStopped() {
       const videoName = result.filePath.split('/').pop();
       if (maxSegmentBytes > 0) {
         status.textContent = `Saved: part ${segmentPartIndex} (${videoName})`;
+      } else if (result.burnedSubtitles) {
+        status.textContent = `Saved MP4 with subtitles: ${videoName}`;
       } else if (result.subtitlePath) {
         status.textContent = `Saved: ${videoName} + subtitles`;
       } else {
@@ -2215,6 +2346,7 @@ async function handleRecordingStopped() {
     if (recordingStreamRef) {
       recordingStreamRef.getTracks().forEach((track) => track.stop());
     }
+    stopRecordingCrop();
     recordingStreamRef = null;
 
     setPreviewSttPanelLocked(false);
@@ -2327,6 +2459,10 @@ function updateSaveConversionElapsedLabel(prefix = 'Elapsed') {
 
 /* ── Keyboard shortcuts ───────────────────────────────────── */
 document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && previewSttWrap?.open) {
+    previewSttWrap.open = false;
+    return;
+  }
   if (e.key === 'Escape' && !settingsModal.classList.contains('hidden')) {
     settingsModal.classList.add('hidden');
   }
@@ -2458,6 +2594,8 @@ window.electronAPI.onBurnProgress((payload) => {
     }
     burnModalClose.classList.remove('hidden');
   } else if (payload.stage === 'error') {
+    saveModal.classList.add('hidden');
+    burnModal.classList.remove('hidden');
     burnModalStatus.textContent = payload.message || 'Burn failed';
     burnModalClose.classList.remove('hidden');
   }
@@ -2469,6 +2607,7 @@ burnModalClose.addEventListener('click', () => {
 
 window.electronAPI.onSttError((payload) => {
   const reason = payload?.reason || 'Speech-to-Text failed';
+  console.error('[soniox][stt-error]', payload || reason);
   status.textContent = reason;
 });
 

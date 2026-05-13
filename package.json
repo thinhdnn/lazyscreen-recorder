@@ -71,6 +71,7 @@
   },
   "dependencies": {
     "@ricky0123/vad-web": "^0.0.30",
+    "ffmpeg-static": "^5.2.0",
     "fix-webm-metainfo": "^1.0.8",
     "ws": "^8.20.0"
   }

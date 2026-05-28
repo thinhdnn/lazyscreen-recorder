@@ -95,6 +95,17 @@ function stopPreviewCrop() {
   }
 }
 
+function stopPreviewCapturePipeline() {
+  stopPreviewCrop();
+  if (previewStream) {
+    previewStream.getTracks().forEach((track) => track.stop());
+    previewStream = null;
+  }
+  if (previewVideo) {
+    previewVideo.srcObject = null;
+  }
+}
+
 async function cropStreamToSelectedArea(stream, rect) {
   if (!rect || currentMode !== 'area') {
     return { stream, cleanup: () => {} };
@@ -130,8 +141,22 @@ async function cropStreamToSelectedArea(stream, rect) {
   const sourceHeight = Math.round(rect.height * scaleY);
   const cropX = Math.max(0, Math.min(video.videoWidth - 1, sourceX));
   const cropY = Math.max(0, Math.min(video.videoHeight - 1, sourceY));
-  const cropWidth = Math.max(1, Math.min(video.videoWidth - cropX, sourceWidth));
-  const cropHeight = Math.max(1, Math.min(video.videoHeight - cropY, sourceHeight));
+  const rawCropWidth = Math.max(
+    1,
+    Math.min(video.videoWidth - cropX, sourceWidth)
+  );
+  const rawCropHeight = Math.max(
+    1,
+    Math.min(video.videoHeight - cropY, sourceHeight)
+  );
+  const cropWidth =
+    rawCropWidth > 1 && rawCropWidth % 2 === 1
+      ? rawCropWidth - 1
+      : rawCropWidth;
+  const cropHeight =
+    rawCropHeight > 1 && rawCropHeight % 2 === 1
+      ? rawCropHeight - 1
+      : rawCropHeight;
 
   const canvas = document.createElement('canvas');
   canvas.width = cropWidth;
@@ -139,6 +164,7 @@ async function cropStreamToSelectedArea(stream, rect) {
   const ctx = canvas.getContext('2d');
   let stopped = false;
   let rafId = 0;
+  let videoFrameCallbackId = 0;
 
   const draw = () => {
     if (stopped) return;
@@ -153,12 +179,37 @@ async function cropStreamToSelectedArea(stream, rect) {
       cropWidth,
       cropHeight
     );
-    rafId = requestAnimationFrame(draw);
   };
-  draw();
 
-  const canvasStream = canvas.captureStream(60);
+  const supportsFrameCallbacks =
+    typeof video.requestVideoFrameCallback === 'function';
+  const supportsManualCanvasFrames =
+    typeof window.CanvasCaptureMediaStreamTrack !== 'undefined' &&
+    typeof window.CanvasCaptureMediaStreamTrack.prototype?.requestFrame === 'function';
+  const canvasStream = canvas.captureStream(
+    supportsFrameCallbacks && supportsManualCanvasFrames ? 0 : 60
+  );
   const croppedVideoTrack = canvasStream.getVideoTracks()[0];
+  const frameDrivenCrop =
+    supportsFrameCallbacks && typeof croppedVideoTrack.requestFrame === 'function';
+
+  if (frameDrivenCrop) {
+    const drawNextSourceFrame = () => {
+      if (stopped) return;
+      draw();
+      croppedVideoTrack.requestFrame();
+      videoFrameCallbackId = video.requestVideoFrameCallback(drawNextSourceFrame);
+    };
+    videoFrameCallbackId = video.requestVideoFrameCallback(drawNextSourceFrame);
+  } else {
+    const drawNextAnimationFrame = () => {
+      if (stopped) return;
+      draw();
+      rafId = requestAnimationFrame(drawNextAnimationFrame);
+    };
+    drawNextAnimationFrame();
+  }
+
   const croppedStream = new MediaStream([
     croppedVideoTrack,
     ...stream.getAudioTracks(),
@@ -169,6 +220,9 @@ async function cropStreamToSelectedArea(stream, rect) {
     cleanup: () => {
       stopped = true;
       if (rafId) cancelAnimationFrame(rafId);
+      if (videoFrameCallbackId && typeof video.cancelVideoFrameCallback === 'function') {
+        video.cancelVideoFrameCallback(videoFrameCallbackId);
+      }
       video.pause();
       video.srcObject = null;
       sourceVideoTrack.stop();
@@ -1258,11 +1312,7 @@ async function showPreview() {
   if (!selectedSource) return;
 
   try {
-    if (previewStream) {
-      previewStream.getTracks().forEach((track) => track.stop());
-      previewStream = null;
-    }
-    stopPreviewCrop();
+    stopPreviewCapturePipeline();
 
     const videoConstraints = {
       mandatory: {
@@ -1291,12 +1341,7 @@ async function showPreview() {
 }
 
 function clearPreviewStream() {
-  stopPreviewCrop();
-  if (previewStream) {
-    previewStream.getTracks().forEach((track) => track.stop());
-    previewStream = null;
-  }
-  previewVideo.srcObject = null;
+  stopPreviewCapturePipeline();
   hideSubtitlePreviewToolbar();
   subtitleOverlay.classList.add('hidden');
   subtitleOverlay.textContent = '';
@@ -1836,6 +1881,7 @@ async function startRecording() {
   try {
     stopAutoStopSourcePreviewMonitor();
     await stopAutoStopExtraStreams();
+    stopPreviewCapturePipeline();
     let videoStream;
     let nativeSystemAudioStream = null;
 
@@ -1975,6 +2021,8 @@ async function startRecording() {
     attachMediaRecorderHandlers();
 
     mediaRecorder.start(1000);
+    previewVideo.srcObject = finalStream;
+    livePreview.classList.remove('hidden');
 
     if (toggleAutoStopSilence.checked) {
       autoStopSilenceMs =
